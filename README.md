@@ -1,122 +1,194 @@
-# 🥗 식단 계획 AI 서비스
+# 인바디 기반 개인 맞춤 식단 추천 시스템
 
-Next.js + FastAPI + PostgreSQL로 구성된 식단 추천 서비스입니다.
+성별 특화 AI 체형 분류 및 맞춤형 식단 추천 시스템
+
+## 🎯 주요 기능
+
+- **6가지 체형 분류**: 성별별 K=3 군집 모델
+  - 남성: 표준형, 과체중형, 근육질형
+  - 여성: 표준형, 마른형, 과체중형
+- **건강 상태 평가**: BMI, 체지방률, 내장지방, 골격근량 종합 분석
+- **맞춤형 식단 추천**: 체형별 칼로리, 영양소, 식품 추천
+- **FastAPI 백엔드**: RESTful API 제공
+- **PostgreSQL**: 인바디 측정 히스토리 관리
 
 ## 📁 프로젝트 구조
 
 ```
 food_plan/
-├── backend/                 # 현재 디렉토리 (FastAPI)
-│   ├── main.py             # FastAPI 애플리케이션
-│   ├── database.py         # DB 연결 설정
-│   ├── models.py           # SQLAlchemy 모델
-│   ├── requirements.txt    # Python 패키지
-│   ├── Dockerfile          # 백엔드 Docker 이미지
-│   └── docker-compose.yml  # 전체 서비스 오케스트레이션
+├── app/                          # FastAPI 애플리케이션
+│   ├── main.py                   # API 서버
+│   ├── models.py                 # DB 모델
+│   └── database.py               # DB 연결
 │
-└── frontend/               # Next.js 프론트엔드 (별도 생성 필요)
-    └── ...
+├── ml/                           # 머신러닝 모듈
+│   ├── inbody_scoring.py         # 건강 평가
+│   ├── predict_cluster.py        # 체형 예측
+│   └── diet_recommendation.py    # 식단 추천
+│
+├── models/                       # 학습된 모델
+│   ├── inbody_male_k3_model.joblib
+│   └── inbody_female_k3_model.joblib
+│
+├── scripts/                      # 학습 스크립트
+│   ├── train_gender_specific.py  # 모델 학습
+│   ├── analyze_clusters.py       # 군집 분석
+│   └── find_optimal_k.py         # K 최적화
+│
+├── tests/                        # 테스트
+│   └── test_inbody_system.py
+│
+├── data/                         # 데이터 및 분석 결과
+│   ├── inbody_cleaned_ml_ready.csv
+│   └── analysis/
+│       ├── cluster_analysis.json
+│       └── optimal_k_analysis.png
+│
+├── archive/                      # 구버전 파일
+│   ├── train_inbody_cluster.py
+│   └── inbody_cluster_model.joblib
+│
+├── run_app.sh                    # 서버 실행 스크립트
+├── run_tests.sh                  # 테스트 실행 스크립트
+├── requirements.txt
+└── docker-compose.yml
 ```
 
-## 🚀 실행 방법
+## 🚀 빠른 시작
 
-### 1. Docker Compose로 전체 실행
-
-```bash
-# 컨테이너 빌드 및 실행
-docker-compose up --build
-
-# 백그라운드 실행
-docker-compose up -d
-
-# 로그 확인
-docker-compose logs -f
-
-# 중지
-docker-compose down
-```
-
-### 2. 로컬에서 개발 (백엔드만)
+### 1. 환경 설정
 
 ```bash
-# 가상환경 생성
+# 가상환경 생성 및 활성화
 python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
 
 # 의존성 설치
 pip install -r requirements.txt
-
-# PostgreSQL 실행 (Docker)
-docker-compose up db -d
-
-# FastAPI 서버 실행
-uvicorn main:app --reload
 ```
 
-## 📡 API 엔드포인트
+### 2. 모델 학습 (최초 1회)
 
-- **GET** `/` - 메인 페이지 (헬스 체크)
-- **POST** `/api/record` - 식단 기록 생성
-  ```json
-  {
-    "goal_calories": 2200
-  }
-  ```
-  응답:
-  ```json
-  {
-    "food_name": "불고기 덮밥",
-    "calories": 800,
-    "message": "목표 칼로리 2200kcal에 맞는 추천 메뉴가 기록되었습니다!"
-  }
-  ```
+```bash
+cd /home/user/food_plan
+source venv/bin/activate
+export PYTHONPATH=/home/user/food_plan:$PYTHONPATH
 
-- **GET** `/api/mypage?limit=10` - 마이페이지 (식단 기록 조회)
-  응답:
-  ```json
-  [
-    {
-      "id": 1,
-      "goal_calories": 2200,
-      "food_name": "불고기 덮밥",
-      "calories": 800,
-      "created_at": "2026-01-23T02:10:05.144227+00:00"
-    }
-  ]
-  ```
+python scripts/train_gender_specific.py \
+  --csv data/inbody_cleaned_ml_ready.csv \
+  --k 3 \
+  --latest_per_user
+```
 
-### API 문서 (자동 생성)
-- Swagger UI: http://localhost:8000/docs
-- ReDoc: http://localhost:8000/redoc
+### 3. 테스트 실행
 
-## 🔧 환경 변수
+```bash
+# 간편 실행
+./run_tests.sh
 
-`.env.example` 파일을 참고하여 `.env` 파일을 생성하세요.
+# 또는 직접 실행
+PYTHONPATH=/home/user/food_plan:$PYTHONPATH python tests/test_inbody_system.py
+```
 
-## 🌐 Next.js 프론트엔드 연동
+### 4. API 서버 실행
 
-프론트엔드는 `http://localhost:3000`에서 실행되며, 백엔드 API를 다음과 같이 호출합니다:
+```bash
+# 간편 실행
+./run_app.sh
 
-```javascript
-// 예시 1: 식단 기록 생성
-const response = await fetch('http://localhost:8000/api/record', {
-  method: 'POST',
-  headers: {
-    'Content-Type': 'application/json',
+# 또는 직접 실행
+PYTHONPATH=/home/user/food_plan:$PYTHONPATH python -m app.main
+```
+
+서버가 `http://localhost:8000`에서 실행됩니다.
+
+## 📡 API 사용법
+
+### 인바디 분석 요청
+
+```bash
+curl -X POST http://localhost:8000/api/analyze-inbody \
+  -H "Content-Type: application/json" \
+  -d '{
+    "height": 175,
+    "weight": 70,
+    "body_fat_pct": 18,
+    "skeletal_muscle_mass": 33,
+    "bmr": 1600,
+    "visceral_fat_level": 5,
+    "gender": "M",
+    "age": 30
+  }'
+```
+
+### 응답 예시
+
+```json
+{
+  "cluster_id": 2,
+  "cluster_name": "남성 근육질형",
+  "description": "체지방률이 낮고 골격근량이 매우 우수한...",
+  "health_evaluation": {
+    "bmi": {"value": 22.9, "category": "정상"},
+    "body_fat": {"level": "정상"},
+    "visceral_fat": {"level": "정상", "risk": "낮음"},
+    "skeletal_muscle": {"level": "우수", "percentage": 47.1}
   },
-  body: JSON.stringify({ goal_calories: 2200 }),
-});
-const data = await response.json();
-console.log(data.food_name); // "불고기 덮밥"
-
-// 예시 2: 마이페이지 조회
-const mypage = await fetch('http://localhost:8000/api/mypage?limit=10');
-const records = await mypage.json();
-console.log(records); // 식단 기록 배열
+  "recommended_diet": {
+    "target_calories": 2728,
+    "macros": {
+      "protein_g": 238.7,
+      "carbs_g": 306.9,
+      "fat_g": 60.6
+    },
+    "recommended_foods": ["스테이크", "닭가슴살", ...],
+    "tips": [...]
+  }
+}
 ```
 
-## 📦 기술 스택
+### 측정 히스토리 조회
+
+```bash
+curl http://localhost:8000/api/inbody-history?user_id=1&limit=10
+```
+
+## 🐳 Docker 실행
+
+```bash
+docker-compose up -d
+```
+
+## 🧪 모델 성능
+
+| 모델 | 샘플 수 | Silhouette Score | 개선율 |
+|------|---------|------------------|--------|
+| 남성 K=3 | 2,629 | 0.1680 | +17.5% |
+| 여성 K=3 | 4,370 | 0.1362 | - |
+
+## 📊 체형별 특성
+
+### 남성
+- **표준형** (30.9%): 평균 체지방률 23.2%, 골격근량 28.1kg
+- **과체중형** (25.8%): 평균 체지방률 30.2%, 골격근량 35.9kg, 내장지방 11.5
+- **근육질형** (43.3%): 평균 체지방률 18.1%, 골격근량 34.1kg
+
+### 여성
+- **표준형** (35.5%): 평균 체지방률 26.7%, 골격근량 23.2kg
+- **마른형** (38.6%): 평균 체지방률 29.6%, 골격근량 19.0kg
+- **과체중형** (25.9%): 평균 체지방률 38.7%, 골격근량 23.1kg, 내장지방 12.8
+
+## 🛠️ 기술 스택
 
 - **Backend**: FastAPI, SQLAlchemy, PostgreSQL
-- **Frontend**: Next.js (별도)
-- **Infrastructure**: Docker, Docker Compose
+- **ML**: scikit-learn, pandas, numpy, joblib
+- **API**: REST API, Pydantic
+- **DevOps**: Docker, docker-compose
+
+## 📝 라이선스
+
+MIT License
+
+## 👨‍💻 개발자
+
+InBody Diet Recommendation System

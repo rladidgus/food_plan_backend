@@ -1,7 +1,7 @@
 from sqlalchemy import Column, Integer, String, DateTime, Float, ForeignKey
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
-from database import Base
+from app.database import Base
 
 
 class User(Base):
@@ -18,7 +18,7 @@ class User(Base):
     weight = Column(Float, nullable=False)
     age = Column(Integer, nullable=False)
     gender = Column(String(10), nullable=False)
-    goal = Column(String(50), nullable=False)
+    goal = Column(String(50), nullable=True)
     
     # 목표 영양소 (메인페이지 계산용)
     goal_calories = Column(Float, nullable=True)
@@ -32,9 +32,16 @@ class User(Base):
     current_carbs = Column(Float, nullable=True)
     current_fats = Column(Float, nullable=True)
 
+    # 인바디 관련 (최신값: 필수 항목만)
+    body_fat_pct = Column(Float, nullable=True)
+    skeletal_muscle_mass = Column(Float, nullable=True)
+    bmr = Column(Float, nullable=True)
+    inbody_score = Column(Integer, nullable=True)
+
     # 관계 설정
     records = relationship("Record", back_populates="user")
     bmi_histories = relationship("BMIHistory", back_populates="user")
+    inbody_records = relationship("InBodyRecord", back_populates="user")
     
     def __repr__(self):
         return f"<User(user_id={self.user_id}, username='{self.username}')>"
@@ -47,7 +54,7 @@ class Food(Base):
     food_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     food_name = Column(String(100), nullable=False)
     food_calories = Column(Float, nullable=False)
-    food_protein = Column(Float, nullable=False)
+    food_proteins = Column(Float, nullable=False)
     food_carbs = Column(Float, nullable=False)
     food_fats = Column(Float, nullable=False)
     
@@ -105,3 +112,33 @@ class BMIHistory(Base):
         return f"<BMIHistory(bmi_history_id={self.bmi_history_id}, user_id={self.user_id}, bmi={self.bmi})>"
 
 
+class InBodyRecord(Base):
+    """인바디 측정 기록 테이블"""
+    __tablename__ = "inbody_records"
+    
+    inbody_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.user_id"), nullable=False)
+    
+    # 인바디 측정값
+    measurement_date = Column(DateTime(timezone=True), nullable=True) # 측정 날짜
+    height = Column(Float, nullable=True)              # 키 (cm)
+    weight = Column(Float, nullable=True)              # 체중 (kg)
+    body_fat_mass = Column(Float, nullable=True)       # 체지방량 (kg)
+    body_fat_pct = Column(Float, nullable=True)        # 체지방률 (%)
+    skeletal_muscle_mass = Column(Float, nullable=True)  # 골격근량 (kg)
+    bmr = Column(Float, nullable=True)                 # 기초대사량 (kcal)
+    visceral_fat_level = Column(Integer, nullable=True)  # 내장지방레벨
+    abdominal_fat_ratio = Column(Float, nullable=True)   # 복부지방률
+    inbody_score = Column(Integer, nullable=True)      # 인바디점수
+    
+    # 예측 결과
+    predicted_cluster = Column(Integer, nullable=True)  # 예측된 군집 ID
+    cluster_name = Column(String(50), nullable=True)    # 군집 이름
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    # 관계 설정
+    user = relationship("User", back_populates="inbody_records")
+    
+    def __repr__(self):
+        return f"<InBodyRecord(inbody_id={self.inbody_id}, user_id={self.user_id}, cluster={self.cluster_name})>"
