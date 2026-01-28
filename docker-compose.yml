@@ -36,6 +36,6 @@ services:
       - "8000:8000"  # API 포트 개방
     volumes:
       - .:/app  # 개발 중 코드 변경 반영
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     stdin_open: true
     tty: true
