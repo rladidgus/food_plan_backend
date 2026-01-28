@@ -6,6 +6,7 @@ import os
 import re
 from typing import Optional
 from pathlib import Path
+from datetime import datetime, timezone
 
 import requests
 from dotenv import load_dotenv
@@ -320,12 +321,12 @@ def format_key_values(values: dict) -> str:
     return "\n".join(lines).strip()
 
 
-def update_user_inbody(user_id: int, values: dict) -> None:
+def update_user_inbody(user_number: int, values: dict) -> None:
     db = SessionLocal()
     try:
-        user = db.query(User).filter(User.user_number == user_id).one_or_none()
+        user = db.query(User).filter(User.user_number == user_number).one_or_none()
         if not user:
-            raise RuntimeError(f"user_id={user_id} 사용자를 찾을 수 없습니다.")
+            raise RuntimeError(f"user_number={user_number} 사용자를 찾을 수 없습니다.")
 
         profile = db.query(UserProfile).filter(UserProfile.user_number == user.user_number).one_or_none()
         if not profile:
@@ -350,6 +351,7 @@ def update_user_inbody(user_id: int, values: dict) -> None:
         # InBodyRecord 저장 (이력 관리)
         new_record = InBodyRecord(
             user_number=user.user_number,
+            measurement_date=datetime.now(timezone.utc),
             height=values.get("height"),
             weight=values.get("weight"),
             body_fat_mass=values.get("body_fat_mass"),
@@ -375,7 +377,7 @@ def update_user_inbody(user_id: int, values: dict) -> None:
         db.close()
 
 
-def ocr_from_camera(image: Image.Image, user_id: Optional[int] = None) -> str:
+def ocr_from_camera(image: Image.Image, user_number: Optional[int] = None) -> str:
     """Gradio에서 들어온 PIL 이미지를 임시 파일로 저장 후 OCR"""
     if image is None:
         return "이미지를 업로드/촬영해 주세요."
@@ -389,8 +391,8 @@ def ocr_from_camera(image: Image.Image, user_id: Optional[int] = None) -> str:
         values = extract_key_values(text)
         if not values:
             return "(핵심 항목을 추출하지 못했습니다. 더 선명하게 찍어보세요.)"
-        if user_id is not None:
-            update_user_inbody(int(user_id), values)
+        if user_number is not None:
+            update_user_inbody(int(user_number), values)
         return format_key_values(values)
     except Exception as e:
         print(f"OCR 실패: {e}")
@@ -408,7 +410,7 @@ def build_demo():
                 type="pil",
                 label="인바디 사진 (카메라/업로드)",
             ),
-            gr.Number(label="user_id (로그인 사용자)", precision=0),
+            gr.Number(label="user_number (로그인 사용자)", precision=0),
         ],
         outputs=gr.Textbox(label="추출된 핵심 항목", lines=12),
         title="InBody OCR (Upstage)",
@@ -420,14 +422,14 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="InBody OCR runner")
     parser.add_argument("--image", help="샘플 이미지 경로로 OCR 테스트 실행")
-    parser.add_argument("--user-id", type=int, help="OCR 결과를 저장할 사용자 ID")
+    parser.add_argument("--user-number", type=int, help="OCR 결과를 저장할 사용자 번호")
     args = parser.parse_args()
 
     if args.image:
         text = upstage_ocr_from_path(args.image)
         values = extract_key_values(text)
-        if args.user_id and values:
-            update_user_inbody(args.user_id, values)
+        if args.user_number and values:
+            update_user_inbody(args.user_number, values)
         print(format_key_values(values))
     else:
         # 같은 Wi-Fi에서 휴대폰으로 접속하려면 0.0.0.0 로 열어야 함

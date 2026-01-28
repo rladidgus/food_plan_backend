@@ -21,6 +21,7 @@ class User(Base):
     # 관계 설정
     profile = relationship("UserProfile", back_populates="user", uselist=False)
     goals = relationship("UserGoal", back_populates="user")
+    foods = relationship("Food", back_populates="user")
     records = relationship("Record", back_populates="user")
     bmi_histories = relationship("BMIHistory", back_populates="user")
     inbody_records = relationship("InBodyRecord", back_populates="user")
@@ -86,6 +87,7 @@ class Food(Base):
     __tablename__ = "food"
     
     food_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    user_number = Column(Integer, ForeignKey("users.user_number"), nullable=True)
     food_name = Column(String(100), nullable=False)
     food_calories = Column(Float, nullable=False)
     food_proteins = Column(Float, nullable=False)
@@ -94,6 +96,7 @@ class Food(Base):
     food_image = Column(String, nullable=True)
     
     # 관계 설정
+    user = relationship("User", back_populates="foods")
     records = relationship("Record", back_populates="food")
     
     def __repr__(self):
@@ -116,6 +119,9 @@ class Record(Base):
     food_protein = Column(Float, nullable=False)
     food_carbs = Column(Float, nullable=False)
     food_fats = Column(Float, nullable=False)
+    serving_size = Column(Float, nullable=True)  # 1회 제공량 (예: 100)
+    serving_unit = Column(String(20), nullable=True)  # 제공량 단위 (g, ml, 개 등)
+    quantity = Column(Float, nullable=True)  # 섭취량 (예: 1.5)
 
     # 추가 정보
     goal_calories = Column(Float, nullable=True)  # 해당 기록의 목표 칼로리

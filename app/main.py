@@ -5,9 +5,8 @@ from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, sta
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from passlib.context import CryptContext
 from app.database import get_db, engine, Base
-from app.models import Record, InBodyRecord, User
+from app.models import Record, InBodyRecord, User, UserProfile
 from typing import List, Optional
 from app.inbody_ocr import extract_key_values, format_key_values, upstage_ocr_from_bytes, update_user_inbody, build_demo
 from app.inbody import InbodyInput, BodyTypeResult, classify_body_type
@@ -67,6 +66,7 @@ class InBodyHistoryResponse(BaseModel):
     skeletal_muscle_mass: Optional[float] = None
     predicted_cluster: Optional[int] = None
     cluster_name: Optional[str] = None
+    values: Optional[dict] = None
     created_at: str
     
     class Config:
@@ -79,6 +79,10 @@ class InBodyOcrResponse(BaseModel):
     text: str
     values: dict
     updated: bool
+
+
+class BodyTypeFromUserRequest(BaseModel):
+    user_number: int
 
 
 # DB 테이블 생성
@@ -100,7 +104,8 @@ def root():
     }
 
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# bcrypt는 72바이트 제한이 있어 길이가 긴 비밀번호에서 500이 날 수 있으므로
+# bcrypt_sha256을 우선 사용하고 기존 bcrypt 해시도 허용한다.
 
 class UserCreate(BaseModel):
     id: str
@@ -112,7 +117,7 @@ class UserLogin(BaseModel):
     password: str
 
 class AuthResponse(BaseModel):
-    user_id: int
+    user_number: int
     id: str
     username: str
     message: str
@@ -128,13 +133,10 @@ def register(user_data: UserCreate, db: Session = Depends(get_db)):
             detail="이미 존재하는 아이디입니다."
         )
     
-    # 비밀번호 해시
-    hashed_password = pwd_context.hash(user_data.password)
-    
     new_user = User(
         id=user_data.id,
         username=user_data.username,
-        password=hashed_password
+        password=user_data.password
         # 나머지 필드(height, weight 등)는 nullable=True이므로 생략 가능
     )
     db.add(new_user)
@@ -142,7 +144,7 @@ def register(user_data: UserCreate, db: Session = Depends(get_db)):
     db.refresh(new_user)
     
     return {
-        "user_id": new_user.uid,
+        "user_number": new_user.user_number,
         "id": new_user.id,
         "username": new_user.username,
         "message": "회원가입이 완료되었습니다."
@@ -159,15 +161,15 @@ def login(user_data: UserLogin, db: Session = Depends(get_db)):
             detail="아이디 또는 비밀번호가 올바르지 않습니다."
         )
     
-    # 비밀번호 검증
-    if not pwd_context.verify(user_data.password, user.password):
+    # 비밀번호 검증 (평문 비교)
+    if user_data.password != user.password:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="아이디 또는 비밀번호가 올바르지 않습니다."
         )
     
     return {
-        "user_id": user.uid,
+        "user_number": user.user_number,
         "id": user.id,
         "username": user.username,
         "message": "로그인 성공"
@@ -194,7 +196,7 @@ def create_diet_record(request: DietRecordRequest, db: Session = Depends(get_db)
     
     # DB에 식단 기록 저장 (목표 칼로리 포함)
     record = Record(
-        uid=1,  # TODO: 실제 로그인한 사용자 ID 사용
+        user_number=1,  # TODO: 실제 로그인한 사용자 ID 사용
         goal_calories=goal,
         food_name=food_name,
         food_calories=calories,
@@ -214,12 +216,12 @@ def create_diet_record(request: DietRecordRequest, db: Session = Depends(get_db)
 
 
 @app.get("/api/inbody-history", response_model=List[InBodyHistoryResponse])
-def get_inbody_history(user_id: int = 1, limit: int = 10, db: Session = Depends(get_db)):
+def get_inbody_history(user_number: int = 1, limit: int = 10, db: Session = Depends(get_db)):
     """
     사용자의 인바디 측정 히스토리 조회
     """
     records = db.query(InBodyRecord).filter(
-        InBodyRecord.uid == user_id
+        InBodyRecord.user_number == user_number
     ).order_by(InBodyRecord.created_at.desc()).limit(limit).all()
     
     return [
@@ -232,6 +234,17 @@ def get_inbody_history(user_id: int = 1, limit: int = 10, db: Session = Depends(
             "skeletal_muscle_mass": record.skeletal_muscle_mass,
             "predicted_cluster": record.predicted_cluster,
             "cluster_name": record.cluster_name,
+            "values": {
+                k: v for k, v in {
+                    "height": record.height,
+                    "weight": record.weight,
+                    "body_fat_mass": record.body_fat_mass,
+                    "body_fat_pct": record.body_fat_pct,
+                    "skeletal_muscle_mass": record.skeletal_muscle_mass,
+                    "bmr": record.bmr,
+                    "inbody_score": record.inbody_score,
+                }.items() if v is not None
+            },
             "created_at": record.created_at.isoformat()
         }
         for record in records
@@ -240,7 +253,7 @@ def get_inbody_history(user_id: int = 1, limit: int = 10, db: Session = Depends(
 
 @app.post("/api/inbody-ocr", response_model=InBodyOcrResponse)
 async def inbody_ocr(
-    user_id: int = Form(1),  # 기본값 1 (테스트용)
+    user_number: int = Form(1),  # 기본값 1 (테스트용)
     image: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
@@ -264,7 +277,7 @@ async def inbody_ocr(
         return {"raw_text": text, "text": "", "values": {}, "updated": False}
 
     try:
-        update_user_inbody(user_id, values)
+        update_user_inbody(user_number, values)
     except RuntimeError as e:
         # 사용자를 찾을 수 없는 경우 등
         raise HTTPException(status_code=404, detail=str(e))
@@ -318,6 +331,57 @@ async def vision_food(image: UploadFile = File(...), top_k: int = 5):
 @app.post("/api/classify/bodytype", response_model=BodyTypeResult)
 def classify_endpoint(payload: InbodyInput):
     return classify_body_type(payload)
+
+
+@app.post("/api/classify/bodytype/by-user", response_model=BodyTypeResult)
+def classify_by_user(payload: BodyTypeFromUserRequest, db: Session = Depends(get_db)):
+    record = db.query(InBodyRecord).filter(
+        InBodyRecord.user_number == payload.user_number
+    ).order_by(InBodyRecord.created_at.desc()).first()
+
+    if not record:
+        raise HTTPException(status_code=404, detail="인바디 기록이 없습니다.")
+
+    profile = db.query(UserProfile).filter(
+        UserProfile.user_number == payload.user_number
+    ).one_or_none()
+
+    if not profile or not profile.gender:
+        raise HTTPException(status_code=400, detail="프로필 성별 정보가 없습니다.")
+
+    gender_raw = str(profile.gender).strip().lower()
+    if gender_raw in ("m", "male", "남", "남성"):
+        sex = "M"
+    elif gender_raw in ("f", "female", "여", "여성"):
+        sex = "F"
+    else:
+        raise HTTPException(status_code=400, detail="프로필 성별 정보가 올바르지 않습니다.")
+
+    required_fields = {
+        "height": record.height,
+        "weight": record.weight,
+        "body_fat_mass": record.body_fat_mass,
+        "body_fat_pct": record.body_fat_pct,
+        "skeletal_muscle_mass": record.skeletal_muscle_mass,
+    }
+    missing = [k for k, v in required_fields.items() if v is None]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"인바디 기록 값이 부족합니다: {', '.join(missing)}")
+
+    inbody_input = InbodyInput(
+        sex=sex,
+        height_cm=record.height,
+        weight_kg=record.weight,
+        body_fat_kg=record.body_fat_mass,
+        body_fat_pct=record.body_fat_pct,
+        skeletal_muscle_kg=record.skeletal_muscle_mass,
+        bmr_kcal=record.bmr,
+    )
+    result = classify_body_type(inbody_input)
+    record.predicted_cluster = None
+    record.cluster_name = result.stage2
+    db.commit()
+    return result
 
 if __name__ == "__main__":
     import uvicorn
