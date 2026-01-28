@@ -11,7 +11,7 @@ import requests
 from dotenv import load_dotenv
 from PIL import Image
 from app.database import SessionLocal
-from app.models import User, InBodyRecord, BMIHistory
+from app.models import User, UserProfile, InBodyRecord, BMIHistory
 
 # 1) 환경변수 로드 (.env에 UPSTAGE_API_KEY=... 넣어두면 됨)
 load_dotenv(override=False)
@@ -323,30 +323,33 @@ def format_key_values(values: dict) -> str:
 def update_user_inbody(user_id: int, values: dict) -> None:
     db = SessionLocal()
     try:
-        user = db.query(User).filter(User.user_id == user_id).one_or_none()
+        user = db.query(User).filter(User.user_number == user_id).one_or_none()
         if not user:
             raise RuntimeError(f"user_id={user_id} 사용자를 찾을 수 없습니다.")
 
+        profile = db.query(UserProfile).filter(UserProfile.user_number == user.user_number).one_or_none()
+        if not profile:
+            profile = UserProfile(user_number=user.user_number)
+            db.add(profile)
+
         if "height" in values:
-            user.height = values["height"]
+            profile.height = values["height"]
         if "weight" in values:
-            user.weight = values["weight"]
+            profile.weight = values["weight"]
         if "age" in values:
-            user.age = values["age"]
+            profile.age = values["age"]
         if "gender" in values:
-            user.gender = values["gender"]
+            profile.gender = values["gender"]
         if "body_fat_pct" in values:
-            user.body_fat_pct = values["body_fat_pct"]
+            profile.body_fat_percent = values["body_fat_pct"]
         if "skeletal_muscle_mass" in values:
-            user.skeletal_muscle_mass = values["skeletal_muscle_mass"]
+            profile.skeletal_muscle_mass = values["skeletal_muscle_mass"]
         if "bmr" in values:
-            user.bmr = values["bmr"]
-        if "inbody_score" in values:
-            user.inbody_score = values["inbody_score"]
+            profile.bmr = values["bmr"]
 
         # InBodyRecord 저장 (이력 관리)
         new_record = InBodyRecord(
-            user_id=user.user_id,
+            user_number=user.user_number,
             height=values.get("height"),
             weight=values.get("weight"),
             body_fat_mass=values.get("body_fat_mass"),
@@ -354,6 +357,7 @@ def update_user_inbody(user_id: int, values: dict) -> None:
             skeletal_muscle_mass=values.get("skeletal_muscle_mass"),
             bmr=values.get("bmr"),
             inbody_score=values.get("inbody_score"),
+            source="ocr",
             # 기타 항목은 나중에 확장
         )
         db.add(new_record)
@@ -361,7 +365,7 @@ def update_user_inbody(user_id: int, values: dict) -> None:
         # BMIHistory 저장
         if "bmi" in values:
             new_bmi = BMIHistory(
-                user_id=user.user_id,
+                user_number=user.user_number,
                 bmi=values["bmi"]
             )
             db.add(new_bmi)

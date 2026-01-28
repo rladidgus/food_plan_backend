@@ -9,43 +9,76 @@ class User(Base):
     __tablename__ = "users"
     
     # 기본 정보
-    user_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    user_number = Column(Integer, primary_key=True, index=True, autoincrement=True)
     id = Column(String(50), unique=True, nullable=False)  # 로그인 아이디
     username = Column(String(50), nullable=False)  # 사용자 이름 (표시용)
     password = Column(String(100), nullable=False)
-    user_created_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    provider_user_id = Column(String(100), nullable=True)  # 소셜 로그인용 아이디
+    role = Column(String(20), nullable=False, server_default="user")  # user/admin
     email = Column(String(100), unique=True, nullable=True)
-    height = Column(Float, nullable=True)
-    weight = Column(Float, nullable=True)
-    age = Column(Integer, nullable=True)
-    gender = Column(String(10), nullable=True)
-    goal = Column(String(50), nullable=True)
-    
-    # 목표 영양소 (메인페이지 계산용)
-    goal_calories = Column(Float, nullable=True)
-    goal_protein = Column(Float, nullable=True)
-    goal_carbs = Column(Float, nullable=True)
-    goal_fats = Column(Float, nullable=True)
-
-    # 현재 영양소 (메인페이지 계산용)
-    current_calories = Column(Float, nullable=True)
-    current_protein = Column(Float, nullable=True)
-    current_carbs = Column(Float, nullable=True)
-    current_fats = Column(Float, nullable=True)
-
-    # 인바디 관련 (최신값: 필수 항목만)
-    body_fat_pct = Column(Float, nullable=True)
-    skeletal_muscle_mass = Column(Float, nullable=True)
-    bmr = Column(Float, nullable=True)
-    inbody_score = Column(Integer, nullable=True)
 
     # 관계 설정
+    profile = relationship("UserProfile", back_populates="user", uselist=False)
+    goals = relationship("UserGoal", back_populates="user")
     records = relationship("Record", back_populates="user")
     bmi_histories = relationship("BMIHistory", back_populates="user")
     inbody_records = relationship("InBodyRecord", back_populates="user")
     
     def __repr__(self):
-        return f"<User(user_id={self.user_id}, username='{self.username}')>"
+        return f"<User(user_number={self.user_number}, username='{self.username}')>"
+
+
+class UserProfile(Base):
+    """유저 프로필 테이블"""
+    __tablename__ = "user_profiles"
+
+    profile_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    user_number = Column(Integer, ForeignKey("users.user_number"), nullable=False, unique=True)
+
+    height = Column(Float, nullable=True)  # 키
+    weight = Column(Float, nullable=True)  # 몸무게
+    age = Column(Integer, nullable=True)   # 나이
+    birth_date = Column(DateTime(timezone=True), nullable=True)  # 생년월일
+    gender = Column(String(10), nullable=True)  # 성별
+    goal_type = Column(String(20), nullable=True)  # diet/bulk/maintain 등
+    body_fat_percent = Column(Float, nullable=True)  # 체지방률
+    skeletal_muscle_mass = Column(Float, nullable=True)  # 골격근량
+    bmr = Column(Float, nullable=True)  # 기초대사량
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    user = relationship("User", back_populates="profile")
+
+    def __repr__(self):
+        return f"<UserProfile(profile_id={self.profile_id}, user_number={self.user_number})>"
+
+
+class UserGoal(Base):
+    """사용자 목표 테이블"""
+    __tablename__ = "user_goals"
+
+    goal_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    id = Column(String(50), nullable=True)  # 로그인 아이디(스냅샷)
+    user_number = Column(Integer, ForeignKey("users.user_number"), nullable=False)
+
+    goal_type = Column(String(20), nullable=False)  # diet/maintain/bulk
+    target_calory = Column(Float, nullable=True)
+    target_protein = Column(Float, nullable=True)
+    target_carb = Column(Float, nullable=True)
+    target_fat = Column(Float, nullable=True)
+    target_macros = Column(String(50), nullable=True)  # "C:P:F" 또는 비율 문자열
+    target_pace = Column(String(50), nullable=True)  # 감량/증량 목표
+    start_date = Column(DateTime(timezone=True), nullable=True)
+    end_date = Column(DateTime(timezone=True), nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", back_populates="goals")
+
+    def __repr__(self):
+        return f"<UserGoal(goal_id={self.goal_id}, user_number={self.user_number}, goal_type={self.goal_type})>"
 
 
 class Food(Base):
@@ -55,9 +88,10 @@ class Food(Base):
     food_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     food_name = Column(String(100), nullable=False)
     food_calories = Column(Float, nullable=False)
-    food_protein = Column(Float, nullable=False)
+    food_proteins = Column(Float, nullable=False)
     food_carbs = Column(Float, nullable=False)
     food_fats = Column(Float, nullable=False)
+    food_image = Column(String, nullable=True)
     
     # 관계 설정
     records = relationship("Record", back_populates="food")
@@ -71,7 +105,7 @@ class Record(Base):
     __tablename__ = "records"
     
     record_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    user_id = Column(Integer, ForeignKey("users.user_id"), nullable=False)
+    user_number = Column(Integer, ForeignKey("users.user_number"), nullable=False)
     
     food_id = Column(Integer, ForeignKey("food.food_id"), nullable=True)
     
@@ -102,7 +136,7 @@ class BMIHistory(Base):
     __tablename__ = "bmi_history"
     
     bmi_history_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    user_id = Column(Integer, ForeignKey("users.user_id"), nullable=False)
+    user_number = Column(Integer, ForeignKey("users.user_number"), nullable=False)
     bmi = Column(Float, nullable=False)
     bmi_history_created_at = Column(DateTime(timezone=True), server_default=func.now())
     
@@ -110,7 +144,7 @@ class BMIHistory(Base):
     user = relationship("User", back_populates="bmi_histories")
     
     def __repr__(self):
-        return f"<BMIHistory(bmi_history_id={self.bmi_history_id}, user_id={self.user_id}, bmi={self.bmi})>"
+        return f"<BMIHistory(bmi_history_id={self.bmi_history_id}, user_number={self.user_number}, bmi={self.bmi})>"
 
 
 class InBodyRecord(Base):
@@ -118,7 +152,7 @@ class InBodyRecord(Base):
     __tablename__ = "inbody_records"
     
     inbody_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    user_id = Column(Integer, ForeignKey("users.user_id"), nullable=False)
+    user_number = Column(Integer, ForeignKey("users.user_number"), nullable=False)
     
     # 인바디 측정값
     measurement_date = Column(DateTime(timezone=True), nullable=True) # 측정 날짜
@@ -142,6 +176,6 @@ class InBodyRecord(Base):
     
     def __repr__(self):
         return (
-            f"<InBodyRecord(inbody_id={self.inbody_id}, user_id={self.user_id}, "
+            f"<InBodyRecord(inbody_id={self.inbody_id}, user_number={self.user_number}, "
             f"measurement_date={self.measurement_date}, source={self.source})>"
         )

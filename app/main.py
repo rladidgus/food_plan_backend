@@ -142,7 +142,7 @@ def register(user_data: UserCreate, db: Session = Depends(get_db)):
     db.refresh(new_user)
     
     return {
-        "user_id": new_user.user_id,
+        "user_id": new_user.uid,
         "id": new_user.id,
         "username": new_user.username,
         "message": "회원가입이 완료되었습니다."
@@ -167,7 +167,7 @@ def login(user_data: UserLogin, db: Session = Depends(get_db)):
         )
     
     return {
-        "user_id": user.user_id,
+        "user_id": user.uid,
         "id": user.id,
         "username": user.username,
         "message": "로그인 성공"
@@ -194,7 +194,7 @@ def create_diet_record(request: DietRecordRequest, db: Session = Depends(get_db)
     
     # DB에 식단 기록 저장 (목표 칼로리 포함)
     record = Record(
-        user_id=1,  # TODO: 실제 로그인한 사용자 ID 사용
+        uid=1,  # TODO: 실제 로그인한 사용자 ID 사용
         goal_calories=goal,
         food_name=food_name,
         food_calories=calories,
@@ -219,7 +219,7 @@ def get_inbody_history(user_id: int = 1, limit: int = 10, db: Session = Depends(
     사용자의 인바디 측정 히스토리 조회
     """
     records = db.query(InBodyRecord).filter(
-        InBodyRecord.user_id == user_id
+        InBodyRecord.uid == user_id
     ).order_by(InBodyRecord.created_at.desc()).limit(limit).all()
     
     return [
@@ -230,6 +230,8 @@ def get_inbody_history(user_id: int = 1, limit: int = 10, db: Session = Depends(
             "weight": record.weight,
             "body_fat_pct": record.body_fat_pct,
             "skeletal_muscle_mass": record.skeletal_muscle_mass,
+            "predicted_cluster": record.predicted_cluster,
+            "cluster_name": record.cluster_name,
             "created_at": record.created_at.isoformat()
         }
         for record in records
