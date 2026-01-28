@@ -1,17 +1,16 @@
 import os
 import time
 import gradio as gr
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from passlib.context import CryptContext
 from app.database import get_db, engine, Base
 from app.models import Record, InBodyRecord, User
 from typing import List, Optional
 from app.inbody_ocr import extract_key_values, format_key_values, upstage_ocr_from_bytes, update_user_inbody, build_demo
-from ml.hybrid_classifier import HybridBodyTypeClassifier
-from ml.diet_recommendation import recommend_diet_unified
-from ml.inbody_scoring import get_comprehensive_evaluation
+from app.inbody import InbodyInput, BodyTypeResult, classify_body_type
 
 # 환경 변수에서 DB 정보 가져오기
 DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -29,10 +28,7 @@ app = gr.mount_gradio_app(app, ocr_demo, path="/ocr-web")
 # CORS 설정 (Next.js 프론트엔드와 통신)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",  # Next.js 개발 서버
-        "http://localhost:3001",  # 대체 포트
-    ],
+    allow_origins=["localhost:3000"],  # 개발 및 테스트를 위해 모든 출처 허용
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -61,46 +57,6 @@ class MyPageResponse(BaseModel):
         from_attributes = True
 
 
-class InBodyInput(BaseModel):
-    """인바디 데이터 입력 스키마"""
-    height: float
-    weight: float
-    body_fat_pct: float
-    skeletal_muscle_mass: float
-    bmr: float
-    visceral_fat_level: int
-    age: Optional[int] = None
-    gender: str  # "M" or "F"
-    birth_year: Optional[int] = None
-    
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "height": 175,
-                "weight": 70,
-                "body_fat_pct": 18,
-                "skeletal_muscle_mass": 33,
-                "bmr": 1600,
-                "visceral_fat_level": 5,
-                "gender": "M",
-                "age": 30
-            }
-        }
-
-
-class BodyTypeResponse(BaseModel):
-    """체형 분석 결과 (하이브리드)"""
-    primary_type: str  # "마른형", "표준형", "과체중형", "근육형"
-    secondary_tags: List[str]  # ["건강", "근육질"] 등
-    display_name: str  # "표준형 (건강)"
-    classification_method: str  # "rule" or "ml"
-    bmi: float
-    muscle_ratio: float
-    health_evaluation: dict
-    recommended_diet: dict
-    meal_plan_example: Optional[dict] = None
-
-
 class InBodyHistoryResponse(BaseModel):
     """인바디 히스토리 응답"""
     inbody_id: int
@@ -125,31 +81,14 @@ class InBodyOcrResponse(BaseModel):
     updated: bool
 
 
-# 전역 변수: 하이브리드 분류기 (서버 시작 시 1회 로드)
-classifier = None
-
 # DB 테이블 생성
 @app.on_event("startup")
 def startup_event():
-    """애플리케이션 시작 시 DB 테이블 생성 및 분류기 로드"""
-    global classifier
+    """애플리케이션 시작 시 DB 테이블 생성"""
     print("🚀 FastAPI 서버 시작 중...")
     time.sleep(3)  # DB가 준비될 때까지 대기
     Base.metadata.create_all(bind=engine)
     print("✅ 데이터베이스 초기화 완료")
-    
-    # 하이브리드 분류기 로드
-    try:
-        classifier = HybridBodyTypeClassifier(
-            male_model_path="models/inbody_male_k4_model.joblib",
-            female_model_path="models/inbody_female_k4_model.joblib"
-        )
-        print("✅ 하이브리드 체형 분류기 로드 완료")
-        print("   - 남성 모델: models/inbody_male_k4_model.joblib")
-        print("   - 여성 모델: models/inbody_female_k4_model.joblib")
-    except FileNotFoundError as e:
-        print(f"⚠️  모델 파일을 찾을 수 없습니다: {e}")
-        print("   K=4 모델이 없으면 규칙 기반만 사용됩니다.")
 
 @app.get("/")
 def root():
@@ -161,7 +100,78 @@ def root():
     }
 
 
-@app.post("/api/record", response_model=DietRecordResponse)
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+class UserCreate(BaseModel):
+    id: str
+    username: str
+    password: str
+
+class UserLogin(BaseModel):
+    id: str
+    password: str
+
+class AuthResponse(BaseModel):
+    user_id: int
+    id: str
+    username: str
+    message: str
+
+@app.post("/api/register", response_model=AuthResponse)
+def register(user_data: UserCreate, db: Session = Depends(get_db)):
+    """회원가입"""
+    # 아이디 중복 확인
+    existing_user = db.query(User).filter(User.id == user_data.id).first()
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="이미 존재하는 아이디입니다."
+        )
+    
+    # 비밀번호 해시
+    hashed_password = pwd_context.hash(user_data.password)
+    
+    new_user = User(
+        id=user_data.id,
+        username=user_data.username,
+        password=hashed_password
+        # 나머지 필드(height, weight 등)는 nullable=True이므로 생략 가능
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    
+    return {
+        "user_id": new_user.user_id,
+        "id": new_user.id,
+        "username": new_user.username,
+        "message": "회원가입이 완료되었습니다."
+    }
+
+@app.post("/api/login", response_model=AuthResponse)
+def login(user_data: UserLogin, db: Session = Depends(get_db)):
+    """로그인"""
+    # 로그인 아이디(id)로 사용자 검색
+    user = db.query(User).filter(User.id == user_data.id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="아이디 또는 비밀번호가 올바르지 않습니다."
+        )
+    
+    # 비밀번호 검증
+    if not pwd_context.verify(user_data.password, user.password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="아이디 또는 비밀번호가 올바르지 않습니다."
+        )
+    
+    return {
+        "user_id": user.user_id,
+        "id": user.id,
+        "username": user.username,
+        "message": "로그인 성공"
+    }
 def create_diet_record(request: DietRecordRequest, db: Session = Depends(get_db)):
     """
     칼로리에 기반한 식단 기록 생성
@@ -203,111 +213,6 @@ def create_diet_record(request: DietRecordRequest, db: Session = Depends(get_db)
     }
 
 
-@app.get("/api/mypage", response_model=List[MyPageResponse])
-def get_mypage(limit: int = 10, db: Session = Depends(get_db)):
-    """
-    마이페이지 - 사용자의 식단 기록 조회
-    """
-    records = db.query(Record).order_by(Record.record_created_at.desc()).limit(limit).all()
-    
-    return [
-        {
-            "id": record.record_id,
-            "goal_calories": record.goal_calories or 0,  # 기존 데이터 호환
-            "food_name": record.food_name,
-            "calories": record.food_calories,  # food_calories로 수정
-            "created_at": record.record_created_at.isoformat()
-        }
-        for record in records
-    ]
-
-
-@app.post("/api/analyze-inbody", response_model=BodyTypeResponse)
-def analyze_inbody(data: InBodyInput, db: Session = Depends(get_db)):
-    """
-    하이브리드 인바디 분석 (규칙 기반 + ML)
-    
-    사용자의 인바디 측정 데이터를 입력받아:
-    1. 하이브리드 체형 분류 (1차: 4가지 체형, 2차: 세부 태그)
-    2. 건강 상태 종합 평가
-    3. 맞춤형 식단 추천 (4가지 체형 기반)
-    4. DB에 기록 저장
-    """
-    if classifier is None:
-        # 분류기 없어도 작동 (규칙 기반만 사용)
-        print("⚠️ 분류기 미로드, 규칙 기반만 사용")
-    
-    # 1. 하이브리드 체형 분류
-    classification = classifier.classify(
-        gender=data.gender,
-        height=data.height,
-        weight=data.weight,
-        body_fat_pct=data.body_fat_pct,
-        skeletal_muscle_mass=data.skeletal_muscle_mass,
-        bmr=data.bmr,
-        visceral_fat_level=data.visceral_fat_level,
-        age=data.age,
-        birth_year=data.birth_year
-    ) if classifier else {
-        "primary_type": "표준형",
-        "secondary_tags": [],
-        "display_name": "표준형",
-        "classification_method": "rule",
-        "bmi": 0,
-        "muscle_ratio": 0
-    }
-    
-    # 2. 건강 상태 종합 평가
-    health_eval = get_comprehensive_evaluation(
-        height=data.height,
-        weight=data.weight,
-        body_fat_pct=data.body_fat_pct,
-        skeletal_muscle_mass=data.skeletal_muscle_mass,
-        visceral_fat_level=data.visceral_fat_level,
-        bmr=data.bmr,
-        gender=data.gender,
-        age=data.age
-    )
-    
-    # 3. 통일된 식단 추천 (4가지 체형)
-    diet = recommend_diet_unified(
-        primary_type=classification["primary_type"],
-        gender=data.gender,
-        bmr=data.bmr,
-        activity_level="moderate",
-        secondary_tags=classification["secondary_tags"]
-    )
-    
-    # 4. DB에 저장
-    inbody_record = InBodyRecord(
-        user_id=1,  # TODO: 실제 사용자 ID
-        height=data.height,
-        weight=data.weight,
-        body_fat_pct=data.body_fat_pct,
-        skeletal_muscle_mass=data.skeletal_muscle_mass,
-        bmr=data.bmr,
-        visceral_fat_level=data.visceral_fat_level,
-        inbody_score=health_eval.get("estimated_score"),
-        predicted_cluster=None,  # 하이브리드는 cluster_id 없음
-        cluster_name=classification["display_name"]
-    )
-    db.add(inbody_record)
-    db.commit()
-    db.refresh(inbody_record)
-    
-    return {
-        "primary_type": classification["primary_type"],
-        "secondary_tags": classification["secondary_tags"],
-        "display_name": classification["display_name"],
-        "classification_method": classification["classification_method"],
-        "bmi": classification["bmi"],
-        "muscle_ratio": classification["muscle_ratio"],
-        "health_evaluation": health_eval,
-        "recommended_diet": diet,
-        "meal_plan_example": None  # TODO: 추가 가능
-    }
-
-
 @app.get("/api/inbody-history", response_model=List[InBodyHistoryResponse])
 def get_inbody_history(user_id: int = 1, limit: int = 10, db: Session = Depends(get_db)):
     """
@@ -325,8 +230,6 @@ def get_inbody_history(user_id: int = 1, limit: int = 10, db: Session = Depends(
             "weight": record.weight,
             "body_fat_pct": record.body_fat_pct,
             "skeletal_muscle_mass": record.skeletal_muscle_mass,
-            "predicted_cluster": record.predicted_cluster,
-            "cluster_name": record.cluster_name,
             "created_at": record.created_at.isoformat()
         }
         for record in records
@@ -335,7 +238,7 @@ def get_inbody_history(user_id: int = 1, limit: int = 10, db: Session = Depends(
 
 @app.post("/api/inbody-ocr", response_model=InBodyOcrResponse)
 async def inbody_ocr(
-    user_id: int = Form(...),
+    user_id: int = Form(1),  # 기본값 1 (테스트용)
     image: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
@@ -369,6 +272,51 @@ async def inbody_ocr(
     return {"raw_text": text, "text": format_key_values(values), "values": values, "updated": True}
 
 
+@app.post("/api/vision/food")
+async def vision_food(image: UploadFile = File(...), top_k: int = 5):
+    import tempfile
+    import traceback
+    from app.food_lens import recognize_and_explain  # 함수 내부 또는 상단에서 임포트
+
+    print(f"▶ [API Start] /api/vision/food requested with file: {image.filename}")
+    
+    try:
+        # 파일 임시 저장
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+            content = await image.read()
+            print(f"   - File size: {len(content)} bytes")
+            tmp.write(content)
+            tmp_path = tmp.name
+
+        print(f"   - Temp file created at: {tmp_path}")
+
+        # 비전 분석 로직 실행
+        result = recognize_and_explain(tmp_path, top_k=top_k)
+        print("   - Recognition successful")
+        return result
+
+    except Exception as e:
+        # 에러 발생 시 콘솔에 상세 출력
+        print("\n" + "="*60)
+        print(f"🚨 [Error] /api/vision/food failed!")
+        print(f"   - Error Message: {e}")
+        print("-" * 60)
+        print(traceback.format_exc())  # 에러 스택 트레이스 출력
+        print("="*60 + "\n")
+        
+        # 클라이언트에게도 500 에러 전달
+        raise HTTPException(status_code=500, detail=f"Vision API Error: {str(e)}")
+
+    finally:
+        # 임시 파일 삭제
+        if 'tmp_path' in locals() and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+            print("   - Temp file deleted.")
+            
+@app.post("/api/classify/bodytype", response_model=BodyTypeResult)
+def classify_endpoint(payload: InbodyInput):
+    return classify_body_type(payload)
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="loaclhost", port=8000)
+    uvicorn.run(app, host="localhost", port=8000)

@@ -10,14 +10,15 @@ class User(Base):
     
     # 기본 정보
     user_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    username = Column(String(50), unique=True, nullable=False)
+    id = Column(String(50), unique=True, nullable=False)  # 로그인 아이디
+    username = Column(String(50), nullable=False)  # 사용자 이름 (표시용)
     password = Column(String(100), nullable=False)
     user_created_at = Column(DateTime(timezone=True), server_default=func.now())
-    email = Column(String(100), unique=True, nullable=False)
-    height = Column(Float, nullable=False)
-    weight = Column(Float, nullable=False)
-    age = Column(Integer, nullable=False)
-    gender = Column(String(10), nullable=False)
+    email = Column(String(100), unique=True, nullable=True)
+    height = Column(Float, nullable=True)
+    weight = Column(Float, nullable=True)
+    age = Column(Integer, nullable=True)
+    gender = Column(String(10), nullable=True)
     goal = Column(String(50), nullable=True)
     
     # 목표 영양소 (메인페이지 계산용)
@@ -54,7 +55,7 @@ class Food(Base):
     food_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     food_name = Column(String(100), nullable=False)
     food_calories = Column(Float, nullable=False)
-    food_proteins = Column(Float, nullable=False)
+    food_protein = Column(Float, nullable=False)
     food_carbs = Column(Float, nullable=False)
     food_fats = Column(Float, nullable=False)
     
@@ -127,18 +128,20 @@ class InBodyRecord(Base):
     body_fat_pct = Column(Float, nullable=True)        # 체지방률 (%)
     skeletal_muscle_mass = Column(Float, nullable=True)  # 골격근량 (kg)
     bmr = Column(Float, nullable=True)                 # 기초대사량 (kcal)
-    visceral_fat_level = Column(Integer, nullable=True)  # 내장지방레벨
     abdominal_fat_ratio = Column(Float, nullable=True)   # 복부지방률
     inbody_score = Column(Integer, nullable=True)      # 인바디점수
-    
-    # 예측 결과
-    predicted_cluster = Column(Integer, nullable=True)  # 예측된 군집 ID
-    cluster_name = Column(String(50), nullable=True)    # 군집 이름
-    
+    predicted_cluster = Column(Integer, nullable=True)  # 체형 클러스터 ID (선택)
+    cluster_name = Column(String(50), nullable=True)    # 체형 클러스터 이름 (선택)
+    source = Column(String(20), nullable=True)          # 입력 방식 (manual/ocr/csv)
+    note = Column(String(255), nullable=True)           # 사용자 메모
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     
     # 관계 설정
     user = relationship("User", back_populates="inbody_records")
     
     def __repr__(self):
-        return f"<InBodyRecord(inbody_id={self.inbody_id}, user_id={self.user_id}, cluster={self.cluster_name})>"
+        return (
+            f"<InBodyRecord(inbody_id={self.inbody_id}, user_id={self.user_id}, "
+            f"measurement_date={self.measurement_date}, source={self.source})>"
+        )
