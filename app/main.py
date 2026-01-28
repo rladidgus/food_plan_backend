@@ -288,10 +288,10 @@ async def inbody_ocr(
 
 
 @app.post("/api/vision/food")
-async def vision_food(image: UploadFile = File(...), top_k: int = 5):
+async def vision_food(image: UploadFile = File(...)):
     import tempfile
     import traceback
-    from app.food_lens import recognize_and_explain  # 함수 내부 또는 상단에서 임포트
+    from app.food_lens import decide_food_gpt_only  # 함수 내부 또는 상단에서 임포트
 
     print(f"▶ [API Start] /api/vision/food requested with file: {image.filename}")
     
@@ -306,7 +306,7 @@ async def vision_food(image: UploadFile = File(...), top_k: int = 5):
         print(f"   - Temp file created at: {tmp_path}")
 
         # 비전 분석 로직 실행
-        result = recognize_and_explain(tmp_path, top_k=top_k)
+        result = decide_food_gpt_only(tmp_path)
         print("   - Recognition successful")
         return result
 
@@ -327,6 +327,7 @@ async def vision_food(image: UploadFile = File(...), top_k: int = 5):
         if 'tmp_path' in locals() and os.path.exists(tmp_path):
             os.remove(tmp_path)
             print("   - Temp file deleted.")
+            
             
 @app.post("/api/classify/bodytype", response_model=BodyTypeResult)
 def classify_endpoint(payload: InbodyInput):
