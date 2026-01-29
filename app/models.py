@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Float, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, Date, Float, ForeignKey, UniqueConstraint, Index, text
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.database import Base
@@ -25,6 +25,7 @@ class User(Base):
     records = relationship("Record", back_populates="user")
     bmi_histories = relationship("BMIHistory", back_populates="user")
     inbody_records = relationship("InBodyRecord", back_populates="user")
+    daily_activities = relationship("DailyActivity", back_populates="user")
     
     def __repr__(self):
         return f"<User(user_number={self.user_number}, username='{self.username}')>"
@@ -184,4 +185,55 @@ class InBodyRecord(Base):
         return (
             f"<InBodyRecord(inbody_id={self.inbody_id}, user_number={self.user_number}, "
             f"measurement_date={self.measurement_date}, source={self.source})>"
+        )
+
+class DailyActivity(Base):
+    """일일 활동 기록 테이블"""
+    __tablename__ = "daily_activities"
+
+    activity_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    user_number = Column(Integer, ForeignKey("users.user_number"), nullable=False)
+
+    # 활동 정보
+    activity_date = Column(Date, nullable=False)  # 활동 날짜
+    activity_type = Column(String(50), nullable=False)  # 활동 종류 (예: 걷기, 자전거)
+    steps = Column(Integer, nullable=True)  # 걸음 수 (해당 활동에 해당하는 경우)
+    active_kcal = Column(Float, nullable=True)  # 활동 대사량
+    total_kcal = Column(Float, nullable=True)  # 총 대사량
+    workout_minutes = Column(Integer, nullable=True)  # 운동 시간
+    distance_meters = Column(Float, nullable=True)  # 이동 거리 (미터 단위)
+    
+    activity_source = Column(String(20), nullable=True)  # 데이터 출처 (예: 'health_connect' | 'healthkit' | 'manual')
+    activity_source_device = Column(String(100), nullable=True)  # 데이터 출처 디바이스 정보
+    activity_source_app = Column(String(100), nullable=True)  # 데이터 출처 앱 정보
+    activity_source_record_id = Column(String(100), nullable=True)  # 원천 데이터 레코드 ID
+    
+    activity_synced_at = Column(DateTime(timezone=True), nullable=True)  # 데이터 동기화 시각
+    activity_created_at = Column(DateTime(timezone=True), server_default=func.now())  # 활동 데이터 생성 시각
+    activity_updated_at = Column(DateTime(timezone=True), onupdate=func.now())  # 활동 데이터 수정 시각
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_number",
+            "activity_source",
+            "activity_source_record_id",
+            name="uq_daily_activity_source_record",
+        ),
+        Index(
+            "uq_daily_activity_user_date_type_null_source",
+            "user_number",
+            "activity_date",
+            "activity_type",
+            unique=True,
+            postgresql_where=text("activity_source_record_id IS NULL"),
+        ),
+    )
+
+    # 관계 설정
+    user = relationship("User", back_populates="daily_activities")
+
+    def __repr__(self):
+        return (
+            f"<DailyActivity(activity_id={self.activity_id}, user_number={self.user_number}, "
+            f"activity_date={self.activity_date}, activity_type='{self.activity_type}')>"
         )
