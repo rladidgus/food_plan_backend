@@ -1,15 +1,23 @@
 import os
 import time
 import gradio as gr
+from pathlib import Path
+from uuid import uuid4
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from app.food_lens import decide_food_gpt_only
 from app.database import get_db, engine, Base
-from app.models import Record, InBodyRecord, User, UserProfile
+from app.models import Record, InBodyRecord, User, UserProfile, FoodAnalysisResult
+from app import models
 from typing import List, Optional
 from app.inbody_ocr import extract_key_values, format_key_values, upstage_ocr_from_bytes, update_user_inbody, build_demo
 from app.inbody import InbodyInput, BodyTypeResult, classify_body_type
+
+UPLOAD_DIR = Path("uploads/foods")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # 환경 변수에서 DB 정보 가져오기
 DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -23,6 +31,7 @@ app = FastAPI(title="식단 계획 AI API")
 # Gradio OCR 데모 마운트 (카메라 기능 제공)
 ocr_demo = build_demo()
 app = gr.mount_gradio_app(app, ocr_demo, path="/ocr-web")
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 # CORS 설정 (Next.js 프론트엔드와 통신)
 app.add_middleware(
@@ -288,45 +297,77 @@ async def inbody_ocr(
 
 
 @app.post("/api/vision/food")
-async def vision_food(image: UploadFile = File(...)):
-    import tempfile
+async def vision_food(
+    user_number: int = Form(...),
+    image: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
     import traceback
-    from app.food_lens import decide_food_gpt_only  # 함수 내부 또는 상단에서 임포트
 
     print(f"▶ [API Start] /api/vision/food requested with file: {image.filename}")
-    
+
     try:
-        # 파일 임시 저장
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-            content = await image.read()
-            print(f"   - File size: {len(content)} bytes")
-            tmp.write(content)
-            tmp_path = tmp.name
+        # 1) 업로드 파일 영구 저장
+        ext = (Path(image.filename).suffix or ".jpg").lower()
+        filename = f"{uuid4().hex}{ext}"
+        save_path = UPLOAD_DIR / filename
 
-        print(f"   - Temp file created at: {tmp_path}")
+        content = await image.read()
+        print(f"   - File size: {len(content)} bytes")
 
-        # 비전 분석 로직 실행
-        result = decide_food_gpt_only(tmp_path)
+        save_path.write_bytes(content)
+
+        # 프론트/클라이언트에 반환할 경로(규칙은 프로젝트에 맞춰 통일)
+        image_url = f"/uploads/foods/{filename}"
+        print(f"   - Saved file at: {save_path}")
+        print(f"   - image_url: {image_url}")
+
+        # 2) GPT 비전 분석 실행 (로컬 파일 경로로 분석)
+        result = decide_food_gpt_only(str(save_path))
         print("   - Recognition successful")
-        return result
+
+        decision = result["decision"]
+        nutrition = decision["nutrition"]
+
+        # 3) DB INSERT (임시 분석 결과 저장)
+        row = FoodAnalysisResult(
+            user_number=user_number,
+            image_url=image_url,
+            predicted_food_name=decision["chosen_food"],
+            predicted_reason=decision["reason"],
+
+            # 현재 food_lens.py 스키마는 serving_description 문자열만 있음 → g는 일단 None
+            estimated_serving_g=None,
+
+            estimated_calories_kcal=nutrition.get("calories_kcal"),
+            estimated_carbs_g=nutrition.get("carbs_g"),
+            estimated_protein_g=nutrition.get("protein_g"),
+            estimated_fat_g=nutrition.get("fat_g"),
+
+            model="gpt-4.1-mini",
+            status="PENDING",
+        )
+
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+
+        # 4) 응답 (프론트가 나중에 확정할 때 far_id 필요)
+        return {
+            "far_id": row.far_id,
+            "status": row.status,
+            "image_url": image_url,
+            "decision": decision,
+        }
 
     except Exception as e:
-        # 에러 발생 시 콘솔에 상세 출력
         print("\n" + "="*60)
-        print(f"🚨 [Error] /api/vision/food failed!")
+        print("🚨 [Error] /api/vision/food failed!")
         print(f"   - Error Message: {e}")
         print("-" * 60)
-        print(traceback.format_exc())  # 에러 스택 트레이스 출력
+        print(traceback.format_exc())
         print("="*60 + "\n")
-        
-        # 클라이언트에게도 500 에러 전달
         raise HTTPException(status_code=500, detail=f"Vision API Error: {str(e)}")
-
-    finally:
-        # 임시 파일 삭제
-        if 'tmp_path' in locals() and os.path.exists(tmp_path):
-            os.remove(tmp_path)
-            print("   - Temp file deleted.")
             
             
 @app.post("/api/classify/bodytype", response_model=BodyTypeResult)

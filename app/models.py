@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Float, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, Float, ForeignKey, Text, DateTime
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.database import Base
@@ -25,7 +25,7 @@ class User(Base):
     records = relationship("Record", back_populates="user")
     bmi_histories = relationship("BMIHistory", back_populates="user")
     inbody_records = relationship("InBodyRecord", back_populates="user")
-    
+    food_analysis_results = relationship("FoodAnalysisResult", back_populates="user")
     def __repr__(self):
         return f"<User(user_number={self.user_number}, username='{self.username}')>"
 
@@ -136,6 +136,34 @@ class Record(Base):
     def __repr__(self):
         return f"<Record(record_id={self.record_id}, food_name='{self.food_name}', food_calories={self.food_calories})>"
 
+class FoodAnalysisResult(Base):
+    """음식 분석 결과 임시 저장 테이블"""
+    __tablename__ = "food_analysis_results"
+
+    far_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    user_number = Column(Integer, ForeignKey("users.user_number"), nullable=False)
+
+    image_url = Column(String, nullable=False)
+
+    predicted_food_name = Column(String(100), nullable=False)
+    predicted_reason = Column(Text, nullable=True)
+
+    estimated_serving_g = Column(Float, nullable=True)
+    estimated_calories_kcal = Column(Float, nullable=True)
+    estimated_carbs_g = Column(Float, nullable=True)
+    estimated_protein_g = Column(Float, nullable=True)
+    estimated_fat_g = Column(Float, nullable=True)
+
+    model = Column(String(50), nullable=False, server_default="gpt-4.1-mini")
+    status = Column(String(20), nullable=False, server_default="PENDING")
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # 관계 설정 (원하면 User에도 back_populates 추가)
+    user = relationship("User", back_populates="food_analysis_results")
+
+    def __repr__(self):
+        return f"<FoodAnalysisResult(far_id={self.far_id}, user_number={self.user_number}, predicted_food_name='{self.predicted_food_name}')>"
 
 class BMIHistory(Base):
     """BMI 히스토리 테이블 모델"""
