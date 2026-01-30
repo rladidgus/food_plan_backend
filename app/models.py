@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Date, Float, ForeignKey, UniqueConstraint, Index, text, DataTime, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, Date, Float, ForeignKey, UniqueConstraint, Index, text, Text
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.database import Base
@@ -28,6 +28,7 @@ class User(Base):
 
     daily_activities = relationship("DailyActivity", back_populates="user")
     food_analysis_results = relationship("FoodAnalysisResult", back_populates="user")
+    diet_plans = relationship("UserDietPlan", back_populates="user")
     
     def __repr__(self):
         return f"<User(user_number={self.user_number}, username='{self.username}')>"
@@ -69,7 +70,7 @@ class UserGoal(Base):
     user_number = Column(Integer, ForeignKey("users.user_number"), nullable=False)
 
     goal_type = Column(String(20), nullable=False)  # diet/maintain/bulk
-    target_calory = Column(Float, nullable=True)
+    target_calorie = Column(Float, nullable=True)
     target_protein = Column(Float, nullable=True)
     target_carb = Column(Float, nullable=True)
     target_fat = Column(Float, nullable=True)
@@ -94,9 +95,9 @@ class Food(Base):
     user_number = Column(Integer, ForeignKey("users.user_number"), nullable=True)
     food_name = Column(String(100), nullable=False)
     food_calories = Column(Float, nullable=False)
-    food_proteins = Column(Float, nullable=False)
-    food_carbs = Column(Float, nullable=False)
-    food_fats = Column(Float, nullable=False)
+    food_protein = Column(Float, nullable=False)
+    food_carb = Column(Float, nullable=False)
+    food_fat = Column(Float, nullable=False)
     food_image = Column(String, nullable=True)
     
     # 관계 설정
@@ -109,7 +110,7 @@ class Food(Base):
 
 class Record(Base):
     """식단 기록 테이블 - 기록 당시의 영양 정보를 스냅샷으로 저장"""
-    __tablename__ = "records"
+    __tablename__ = "record"
     
     record_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     user_number = Column(Integer, ForeignKey("users.user_number"), nullable=False)
@@ -121,8 +122,8 @@ class Record(Base):
     food_name = Column(String(100), nullable=False)
     food_calories = Column(Float, nullable=False)
     food_protein = Column(Float, nullable=False)
-    food_carbs = Column(Float, nullable=False)
-    food_fats = Column(Float, nullable=False)
+    food_carb = Column(Float, nullable=False)
+    food_fat = Column(Float, nullable=False)
     serving_size = Column(Float, nullable=True)  # 1회 제공량 (예: 100)
     serving_unit = Column(String(20), nullable=True)  # 제공량 단위 (g, ml, 개 등)
     quantity = Column(Float, nullable=True)  # 섭취량 (예: 1.5)
@@ -154,7 +155,7 @@ class FoodAnalysisResult(Base):
 
     estimated_serving_g = Column(Float, nullable=True)
     estimated_calories_kcal = Column(Float, nullable=True)
-    estimated_carbs_g = Column(Float, nullable=True)
+    estimated_carb_g = Column(Float, nullable=True)
     estimated_protein_g = Column(Float, nullable=True)
     estimated_fat_g = Column(Float, nullable=True)
 
@@ -168,6 +169,25 @@ class FoodAnalysisResult(Base):
 
     def __repr__(self):
         return f"<FoodAnalysisResult(far_id={self.far_id}, user_number={self.user_number}, predicted_food_name='{self.predicted_food_name}')>"
+
+
+class UserDietPlan(Base):
+    """사용자 목표 식단 저장 테이블"""
+    __tablename__ = "user_diet_plans"
+
+    plan_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    user_number = Column(Integer, ForeignKey("users.user_number"), nullable=False)
+
+    goal_type = Column(String(20), nullable=False)  # diet/maintain/bulk
+    target_calorie = Column(Float, nullable=True)
+    plan_json = Column(Text, nullable=False)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", back_populates="diet_plans")
+
+    def __repr__(self):
+        return f"<UserDietPlan(plan_id={self.plan_id}, user_number={self.user_number}, goal_type={self.goal_type})>"
 
 class BMIHistory(Base):
     """BMI 히스토리 테이블 모델"""

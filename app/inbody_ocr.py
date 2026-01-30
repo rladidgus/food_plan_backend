@@ -14,7 +14,8 @@ from PIL import Image
 from app.database import SessionLocal
 from app.models import User, UserProfile, InBodyRecord, BMIHistory, UserGoal
 from app.inbody import InbodyInput, classify_body_type
-from app.goal_rules import infer_goal_type, estimate_target_calory, normalize_activity_level
+from app.goal_rules import infer_goal_type, estimate_target_calorie, normalize_activity_level
+from app.diet_plan import create_diet_plan_record
 
 # 1) 환경변수 로드 (.env에 UPSTAGE_API_KEY=... 넣어두면 됨)
 load_dotenv(override=False)
@@ -396,7 +397,7 @@ def update_user_inbody(user_number: int, values: dict) -> None:
             new_record.classify_name = result.stage2
 
             goal_type = infer_goal_type(result.stage1, result.stage2)
-            target_calory = estimate_target_calory(
+            target_calorie = estimate_target_calorie(
                 goal_type=goal_type,
                 bmr_kcal=new_record.bmr,
                 weight_kg=new_record.weight,
@@ -410,20 +411,27 @@ def update_user_inbody(user_number: int, values: dict) -> None:
             )
             if latest_goal:
                 latest_goal.goal_type = goal_type
-                latest_goal.target_calory = target_calory
+                latest_goal.target_calorie = target_calorie
                 latest_goal.start_date = datetime.now(timezone.utc)
             else:
                 latest_goal = UserGoal(
                     user_number=user.user_number,
                     id=user.id,
                     goal_type=goal_type,
-                    target_calory=target_calory,
+                    target_calorie=target_calorie,
                     start_date=datetime.now(timezone.utc),
                 )
                 db.add(latest_goal)
 
             if profile:
                 profile.goal_type = goal_type
+                if target_calorie is not None:
+                    create_diet_plan_record(
+                        db=db,
+                        user_number=user.user_number,
+                        goal_type=goal_type,
+                        target_calorie=target_calorie,
+                    )
 
         db.add(new_record)
 

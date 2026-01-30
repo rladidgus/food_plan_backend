@@ -44,7 +44,7 @@ def infer_goal_type(stage1: str, stage2: str) -> str:
     return "maintain"
 
 
-def estimate_target_calory(
+def estimate_target_calorie(
     goal_type: str,
     bmr_kcal: Optional[float],
     weight_kg: Optional[float],

@@ -1,8 +1,9 @@
 import os
+import json
 import traceback
 import time
 import logging
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, time as dt_time
 import gradio as gr
 from pathlib import Path
 from uuid import uuid4
@@ -20,8 +21,9 @@ from app.models import Record, InBodyRecord, User, UserProfile, FoodAnalysisResu
 from typing import List, Optional
 from app import models
 from app.inbody_ocr import extract_key_values, format_key_values, upstage_ocr_from_bytes, update_user_inbody, build_demo
-from app.models import Record, InBodyRecord, User, UserProfile, UserGoal, DailyActivity
-from app.goal_rules import estimate_target_calory, normalize_activity_level, ACTIVITY_FACTORS
+from app.models import Record, InBodyRecord, User, UserProfile, UserGoal, DailyActivity, UserDietPlan
+from app.goal_rules import estimate_target_calorie, normalize_activity_level, ACTIVITY_FACTORS
+from app.diet_plan import create_diet_plan_record
 
 UPLOAD_DIR = Path("uploads/foods")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -77,7 +79,7 @@ class UserGoalResponse(BaseModel):
     """사용자 목표 응답"""
     goal_id: int
     goal_type: str
-    target_calory: Optional[float] = None
+    target_calorie: Optional[float] = None
     target_protein: Optional[float] = None
     target_carb: Optional[float] = None
     target_fat: Optional[float] = None
@@ -97,22 +99,11 @@ class MyPageResponse(BaseModel):
     goal_calories: int
     food_name: str
     calories: int
-    created_at: str
+    record_created_at: str
     height: Optional[float] = None
     weight: Optional[float] = None
     skeletal_muscle_mass: Optional[float] = None
-    body_fat_pct: Optional[float] = None
-    goal_id: Optional[int] = None
-    goal_type: Optional[str] = None
-    target_calory: Optional[float] = None
-    target_protein: Optional[float] = None
-    target_carb: Optional[float] = None
-    target_fat: Optional[float] = None
-    target_macros: Optional[str] = None
-    target_pace: Optional[str] = None
-    start_date: Optional[str] = None
-    end_date: Optional[str] = None
-    goal_created_at: Optional[str] = None
+    body_fat_percent: Optional[float] = None
 
     class Config:
         from_attributes = True
@@ -122,13 +113,23 @@ class MyPageEnvelopeResponse(BaseModel):
     """마이페이지 응답 모델 (목표 + 식단 기록)"""
     goal: Optional[UserGoalResponse] = None
     records: List[MyPageResponse]
+    diet_plan: Optional[dict] = None
 
 
 class UserGoalUpdateRequest(BaseModel):
     """사용자 목표 변경 요청"""
     user_number: int
     goal_type: str
-    target_calory: Optional[float] = None
+    target_calorie: Optional[float] = None
+
+
+class DietPlanResponse(BaseModel):
+    plan_id: int
+    user_number: int
+    goal_type: str
+    target_calorie: Optional[float] = None
+    plan: dict
+    created_at: Optional[str] = None
 
 
 class ActivityLevelUpdateRequest(BaseModel):
@@ -333,11 +334,17 @@ def get_user(user_number: int = 1, db: Session = Depends(get_db)):
 
 @app.get("/api/user/goal", response_model=UserGoalResponse)
 def get_user_goal(user_number: int = 1, db: Session = Depends(get_db)):
-    """사용자 목표 조회 (최신 1건)"""
+    """사용자 목표 조회"""
     goal = (
         db.query(UserGoal)
         .filter(UserGoal.user_number == user_number)
         .order_by(UserGoal.created_at.desc())
+        .first()
+    )
+    diet_plan = (
+        db.query(UserDietPlan)
+        .filter(UserDietPlan.user_number == user_number)
+        .order_by(UserDietPlan.created_at.desc())
         .first()
     )
     if not goal:
@@ -345,7 +352,7 @@ def get_user_goal(user_number: int = 1, db: Session = Depends(get_db)):
     return {
         "goal_id": goal.goal_id,
         "goal_type": goal.goal_type,
-        "target_calory": goal.target_calory,
+        "target_calorie": goal.target_calorie,
         "target_protein": goal.target_protein,
         "target_carb": goal.target_carb,
         "target_fat": goal.target_fat,
@@ -392,11 +399,11 @@ def upsert_user_goal(payload: UserGoalUpdateRequest, db: Session = Depends(get_d
         .first()
     )
 
-    target_calory = payload.target_calory
-    if target_calory is None:
+    target_calorie = payload.target_calorie
+    if target_calorie is None:
         bmr = latest_inbody.bmr if latest_inbody and latest_inbody.bmr is not None else (profile.bmr if profile else None)
         weight = latest_inbody.weight if latest_inbody and latest_inbody.weight is not None else (profile.weight if profile else None)
-        target_calory = estimate_target_calory(
+        target_calorie = estimate_target_calorie(
             goal_type,
             bmr,
             weight,
@@ -411,7 +418,7 @@ def upsert_user_goal(payload: UserGoalUpdateRequest, db: Session = Depends(get_d
     )
     if latest_goal:
         latest_goal.goal_type = goal_type
-        latest_goal.target_calory = target_calory
+        latest_goal.target_calorie = target_calorie
         latest_goal.start_date = datetime.now(timezone.utc)
         goal = latest_goal
     else:
@@ -419,19 +426,26 @@ def upsert_user_goal(payload: UserGoalUpdateRequest, db: Session = Depends(get_d
             user_number=payload.user_number,
             id=user.id,
             goal_type=goal_type,
-            target_calory=target_calory,
+            target_calorie=target_calorie,
             start_date=datetime.now(timezone.utc),
         )
         db.add(goal)
 
     if profile:
         profile.goal_type = goal_type
+    if target_calorie is not None:
+        create_diet_plan_record(
+            db=db,
+            user_number=payload.user_number,
+            goal_type=goal_type,
+            target_calorie=target_calorie,
+        )
 
     db.commit()
     return {
         "goal_id": goal.goal_id,
         "goal_type": goal.goal_type,
-        "target_calory": goal.target_calory,
+        "target_calorie": goal.target_calorie,
         "target_protein": goal.target_protein,
         "target_carb": goal.target_carb,
         "target_fat": goal.target_fat,
@@ -443,8 +457,30 @@ def upsert_user_goal(payload: UserGoalUpdateRequest, db: Session = Depends(get_d
     }
 
 
+@app.get("/api/user/diet-plan", response_model=Optional[DietPlanResponse])
+def get_latest_diet_plan(user_number: int = 1, db: Session = Depends(get_db)):
+    """사용자의 최신 목표 식단 계획 조회"""
+    plan = (
+        db.query(UserDietPlan)
+        .filter(UserDietPlan.user_number == user_number)
+        .order_by(UserDietPlan.created_at.desc())
+        .first()
+    )
+    if not plan:
+        return None
+    return {
+        "plan_id": plan.plan_id,
+        "user_number": plan.user_number,
+        "goal_type": plan.goal_type,
+        "target_calorie": plan.target_calorie,
+        "plan": json.loads(plan.plan_json),
+        "created_at": plan.created_at.isoformat() if plan.created_at else None,
+    }
+
+
 @app.post("/api/user/activity-level")
 def update_activity_level(payload: ActivityLevelUpdateRequest, db: Session = Depends(get_db)):
+    """사용자 활동 수준 업데이트"""
     level = normalize_activity_level(payload.activity_level)
     if level not in ACTIVITY_FACTORS:
         raise HTTPException(
@@ -524,7 +560,7 @@ def get_mypage_records(user_number: int = 1, limit: int = 10, db: Session = Depe
         latest_inbody.skeletal_muscle_mass if latest_inbody and latest_inbody.skeletal_muscle_mass is not None
         else (profile.skeletal_muscle_mass if profile else None)
     )
-    body_fat_pct = (
+    body_fat_percent = (
         latest_inbody.body_fat_pct if latest_inbody and latest_inbody.body_fat_pct is not None
         else (profile.body_fat_percent if profile else None)
     )
@@ -541,7 +577,7 @@ def get_mypage_records(user_number: int = 1, limit: int = 10, db: Session = Depe
             {
                 "goal_id": goal.goal_id,
                 "goal_type": goal.goal_type,
-                "target_calory": goal.target_calory,
+                "target_calorie": goal.target_calorie,
                 "target_protein": goal.target_protein,
                 "target_carb": goal.target_carb,
                 "target_fat": goal.target_fat,
@@ -554,17 +590,22 @@ def get_mypage_records(user_number: int = 1, limit: int = 10, db: Session = Depe
             if goal
             else None
         ),
+        "diet_plan": (
+            json.loads(diet_plan.plan_json)
+            if diet_plan and diet_plan.plan_json
+            else None
+        ),
         "records": [
             {
                 "id": record.record_id,
                 "goal_calories": int(record.goal_calories) if record.goal_calories is not None else 0,
                 "food_name": record.food_name,
                 "calories": int(record.food_calories),
-                "created_at": record.record_created_at.isoformat() if record.record_created_at else "",
+                "record_created_at": record.record_created_at.isoformat() if record.record_created_at else "",
                 "height": height,
                 "weight": weight,
                 "skeletal_muscle_mass": skeletal_muscle_mass,
-                "body_fat_pct": body_fat_pct,
+                "body_fat_percent": body_fat_percent,
             }
             for record in records
         ],
@@ -822,6 +863,7 @@ def get_record(date: str, user_number: int = 3, db: Session = Depends(get_db)):
 async def vision_food(
     user_number: int = Form(...),
     meal_type: str = Form(...),
+    record_date: Optional[str] = Form(None),
     image: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
@@ -858,6 +900,14 @@ async def vision_food(
         db.refresh(far)
 
         # 2) ✅ 화면 조회용 Record 저장 (GET /api/record가 이걸 가져감)
+        record_created_at = datetime.utcnow()
+        if record_date:
+            try:
+                day = datetime.strptime(record_date, "%Y-%m-%d").date()
+            except ValueError:
+                raise HTTPException(status_code=400, detail="record_date는 YYYY-MM-DD 형식이어야 합니다.")
+            record_created_at = datetime.combine(day, dt_time(12, 0, 0))
+
         rec = Record(
             user_number=user_number,
             food_name=decision["chosen_food"],
@@ -867,7 +917,7 @@ async def vision_food(
             food_fats=nutrition.get("fat_g"),
             meal_type=meal_type,
             image_url=image_url,
-            record_created_at=datetime.utcnow(),
+            record_created_at=record_created_at,
         )
         db.add(rec)
         db.commit()
