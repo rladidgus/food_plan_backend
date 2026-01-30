@@ -12,6 +12,7 @@ from app.models import Record, InBodyRecord, User, UserProfile, UserGoal, DailyA
 from typing import List, Optional
 from app.inbody_ocr import extract_key_values, format_key_values, upstage_ocr_from_bytes, update_user_inbody, build_demo
 from app.inbody import InbodyInput, BodyTypeResult, classify_body_type
+from app.goal_rules import estimate_target_calory, normalize_activity_level, ACTIVITY_FACTORS
 
 # 환경 변수에서 DB 정보 가져오기
 DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -47,22 +48,6 @@ class DietRecordResponse(BaseModel):
     calories: int
     message: str
 
-class MyPageResponse(BaseModel):
-    """마이페이지 식단 기록 응답 모델"""
-    id: int
-    goal_calories: int
-    food_name: str
-    calories: int
-    created_at: str
-    height: Optional[float] = None
-    weight: Optional[float] = None
-    skeletal_muscle_mass: Optional[float] = None
-    body_fat_pct: Optional[float] = None
-
-    class Config:
-        from_attributes = True
-
-
 class UserResponse(BaseModel):
     """사용자 기본 정보 응답"""
     user_number: int
@@ -93,6 +78,51 @@ class UserGoalResponse(BaseModel):
         from_attributes = True
 
 
+class MyPageResponse(BaseModel):
+    """마이페이지 식단 기록 응답 모델"""
+    id: int
+    goal_calories: int
+    food_name: str
+    calories: int
+    created_at: str
+    height: Optional[float] = None
+    weight: Optional[float] = None
+    skeletal_muscle_mass: Optional[float] = None
+    body_fat_pct: Optional[float] = None
+    goal_id: Optional[int] = None
+    goal_type: Optional[str] = None
+    target_calory: Optional[float] = None
+    target_protein: Optional[float] = None
+    target_carb: Optional[float] = None
+    target_fat: Optional[float] = None
+    target_macros: Optional[str] = None
+    target_pace: Optional[str] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    goal_created_at: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class MyPageEnvelopeResponse(BaseModel):
+    """마이페이지 응답 모델 (목표 + 식단 기록)"""
+    goal: Optional[UserGoalResponse] = None
+    records: List[MyPageResponse]
+
+
+class UserGoalUpdateRequest(BaseModel):
+    """사용자 목표 변경 요청"""
+    user_number: int
+    goal_type: str
+    target_calory: Optional[float] = None
+
+
+class ActivityLevelUpdateRequest(BaseModel):
+    user_number: int
+    activity_level: str
+
+
 class InBodyHistoryResponse(BaseModel):
     """인바디 히스토리 응답"""
     inbody_id: int
@@ -101,8 +131,8 @@ class InBodyHistoryResponse(BaseModel):
     weight: Optional[float] = None
     body_fat_pct: Optional[float] = None
     skeletal_muscle_mass: Optional[float] = None
-    predicted_cluster: Optional[int] = None
-    cluster_name: Optional[str] = None
+    predicted_classify: Optional[int] = None
+    classify_name: Optional[str] = None
     values: Optional[dict] = None
     created_at: str
     
@@ -116,6 +146,8 @@ class InBodyOcrResponse(BaseModel):
     text: str
     values: dict
     updated: bool
+    activity_level: Optional[str] = None
+    activity_level_options: Optional[dict] = None
 
 
 class DailyActivityIn(BaseModel):
@@ -311,6 +343,111 @@ def get_user_goal(user_number: int = 1, db: Session = Depends(get_db)):
     }
 
 
+@app.post("/api/user/goal", response_model=UserGoalResponse)
+def upsert_user_goal(payload: UserGoalUpdateRequest, db: Session = Depends(get_db)):
+    """사용자 목표 변경(없으면 생성)"""
+    raw_goal_type = payload.goal_type.strip().lower()
+    goal_type_map = {
+        "diet": "diet",
+        "다이어트": "diet",
+        "감량": "diet",
+        "maintain": "maintain",
+        "유지": "maintain",
+        "표준": "maintain",
+        "bulk": "bulk",
+        "벌크": "bulk",
+        "벌크업": "bulk",
+        "증량": "bulk",
+    }
+    goal_type = goal_type_map.get(raw_goal_type, raw_goal_type)
+    if goal_type not in {"diet", "maintain", "bulk"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="goal_type은 diet/maintain/bulk 중 하나여야 합니다.",
+        )
+
+    user = db.query(User).filter(User.user_number == payload.user_number).one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
+
+    profile = db.query(UserProfile).filter(UserProfile.user_number == payload.user_number).one_or_none()
+    latest_inbody = (
+        db.query(InBodyRecord)
+        .filter(InBodyRecord.user_number == payload.user_number)
+        .order_by(InBodyRecord.created_at.desc())
+        .first()
+    )
+
+    target_calory = payload.target_calory
+    if target_calory is None:
+        bmr = latest_inbody.bmr if latest_inbody and latest_inbody.bmr is not None else (profile.bmr if profile else None)
+        weight = latest_inbody.weight if latest_inbody and latest_inbody.weight is not None else (profile.weight if profile else None)
+        target_calory = estimate_target_calory(
+            goal_type,
+            bmr,
+            weight,
+            normalize_activity_level(profile.activity_level) if profile else None,
+        )
+
+    latest_goal = (
+        db.query(UserGoal)
+        .filter(UserGoal.user_number == payload.user_number)
+        .order_by(UserGoal.created_at.desc())
+        .first()
+    )
+    if latest_goal:
+        latest_goal.goal_type = goal_type
+        latest_goal.target_calory = target_calory
+        latest_goal.start_date = datetime.now(timezone.utc)
+        goal = latest_goal
+    else:
+        goal = UserGoal(
+            user_number=payload.user_number,
+            id=user.id,
+            goal_type=goal_type,
+            target_calory=target_calory,
+            start_date=datetime.now(timezone.utc),
+        )
+        db.add(goal)
+
+    if profile:
+        profile.goal_type = goal_type
+
+    db.commit()
+    return {
+        "goal_id": goal.goal_id,
+        "goal_type": goal.goal_type,
+        "target_calory": goal.target_calory,
+        "target_protein": goal.target_protein,
+        "target_carb": goal.target_carb,
+        "target_fat": goal.target_fat,
+        "target_macros": goal.target_macros,
+        "target_pace": goal.target_pace,
+        "start_date": goal.start_date.isoformat() if goal.start_date else None,
+        "end_date": goal.end_date.isoformat() if goal.end_date else None,
+        "created_at": goal.created_at.isoformat() if goal.created_at else None,
+    }
+
+
+@app.post("/api/user/activity-level")
+def update_activity_level(payload: ActivityLevelUpdateRequest, db: Session = Depends(get_db)):
+    level = normalize_activity_level(payload.activity_level)
+    if level not in ACTIVITY_FACTORS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="activity_level은 sedentary/light/moderate/active 중 하나여야 합니다.",
+        )
+
+    profile = db.query(UserProfile).filter(UserProfile.user_number == payload.user_number).one_or_none()
+    if not profile:
+        profile = UserProfile(user_number=payload.user_number)
+        db.add(profile)
+
+    profile.activity_level = level
+    db.commit()
+    return {"user_number": payload.user_number, "activity_level": level, "factor": ACTIVITY_FACTORS[level]}
+
+
 @app.get("/api/inbody", response_model=Optional[InBodyHistoryResponse])
 def get_latest_inbody(user_number: int = 1, db: Session = Depends(get_db)):
     """사용자 최신 인바디 기록 조회"""
@@ -329,8 +466,8 @@ def get_latest_inbody(user_number: int = 1, db: Session = Depends(get_db)):
         "weight": record.weight,
         "body_fat_pct": record.body_fat_pct,
         "skeletal_muscle_mass": record.skeletal_muscle_mass,
-        "predicted_cluster": record.predicted_cluster,
-        "cluster_name": record.cluster_name,
+        "predicted_classify": record.predicted_classify,
+        "classify_name": record.classify_name,
         "values": {
             k: v for k, v in {
                 "height": record.height,
@@ -346,7 +483,7 @@ def get_latest_inbody(user_number: int = 1, db: Session = Depends(get_db)):
     }
 
 
-@app.get("/api/mypage", response_model=List[MyPageResponse])
+@app.get("/api/mypage", response_model=MyPageEnvelopeResponse)
 def get_mypage_records(user_number: int = 1, limit: int = 10, db: Session = Depends(get_db)):
     """마이페이지 식단 기록 조회"""
     latest_inbody = (
@@ -358,6 +495,12 @@ def get_mypage_records(user_number: int = 1, limit: int = 10, db: Session = Depe
     profile = (
         db.query(UserProfile)
         .filter(UserProfile.user_number == user_number)
+        .first()
+    )
+    goal = (
+        db.query(UserGoal)
+        .filter(UserGoal.user_number == user_number)
+        .order_by(UserGoal.created_at.desc())
         .first()
     )
 
@@ -379,20 +522,39 @@ def get_mypage_records(user_number: int = 1, limit: int = 10, db: Session = Depe
         .limit(limit)
         .all()
     )
-    return [
-        {
-            "id": record.record_id,
-            "goal_calories": int(record.goal_calories) if record.goal_calories is not None else 0,
-            "food_name": record.food_name,
-            "calories": int(record.food_calories),
-            "created_at": record.record_created_at.isoformat() if record.record_created_at else "",
-            "height": height,
-            "weight": weight,
-            "skeletal_muscle_mass": skeletal_muscle_mass,
-            "body_fat_pct": body_fat_pct,
-        }
-        for record in records
-    ]
+    return {
+        "goal": (
+            {
+                "goal_id": goal.goal_id,
+                "goal_type": goal.goal_type,
+                "target_calory": goal.target_calory,
+                "target_protein": goal.target_protein,
+                "target_carb": goal.target_carb,
+                "target_fat": goal.target_fat,
+                "target_macros": goal.target_macros,
+                "target_pace": goal.target_pace,
+                "start_date": goal.start_date.isoformat() if goal.start_date else None,
+                "end_date": goal.end_date.isoformat() if goal.end_date else None,
+                "created_at": goal.created_at.isoformat() if goal.created_at else None,
+            }
+            if goal
+            else None
+        ),
+        "records": [
+            {
+                "id": record.record_id,
+                "goal_calories": int(record.goal_calories) if record.goal_calories is not None else 0,
+                "food_name": record.food_name,
+                "calories": int(record.food_calories),
+                "created_at": record.record_created_at.isoformat() if record.record_created_at else "",
+                "height": height,
+                "weight": weight,
+                "skeletal_muscle_mass": skeletal_muscle_mass,
+                "body_fat_pct": body_fat_pct,
+            }
+            for record in records
+        ],
+    }
 
 
 @app.post("/api/daily-activities/sync", response_model=List[DailyActivityUpsertResult])
@@ -518,8 +680,8 @@ def get_inbody_history(user_number: int = 1, limit: int = 10, db: Session = Depe
             "weight": record.weight,
             "body_fat_pct": record.body_fat_pct,
             "skeletal_muscle_mass": record.skeletal_muscle_mass,
-            "predicted_cluster": record.predicted_cluster,
-            "cluster_name": record.cluster_name,
+            "predicted_classify": record.predicted_classify,
+            "classify_name": record.classify_name,
             "values": {
                 k: v for k, v in {
                     "height": record.height,
@@ -560,7 +722,24 @@ async def inbody_ocr(
     )
     values = extract_key_values(text)
     if not values:
-        return {"raw_text": text, "text": "", "values": {}, "updated": False}
+        profile = (
+            db.query(UserProfile)
+            .filter(UserProfile.user_number == user_number)
+            .first()
+        )
+        return {
+            "raw_text": text,
+            "text": "",
+            "values": {},
+            "updated": False,
+            "activity_level": profile.activity_level if profile else None,
+            "activity_level_options": {
+                "sedentary": 1.2,
+                "light": 1.375,
+                "moderate": 1.55,
+                "active": 1.725,
+            },
+        }
 
     try:
         update_user_inbody(user_number, values)
@@ -570,7 +749,24 @@ async def inbody_ocr(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB 업데이트 실패: {e}")
 
-    return {"raw_text": text, "text": format_key_values(values), "values": values, "updated": True}
+    profile = (
+        db.query(UserProfile)
+        .filter(UserProfile.user_number == user_number)
+        .first()
+    )
+    return {
+        "raw_text": text,
+        "text": format_key_values(values),
+        "values": values,
+        "updated": True,
+        "activity_level": profile.activity_level if profile else None,
+        "activity_level_options": {
+            "sedentary": 1.2,
+            "light": 1.375,
+            "moderate": 1.55,
+            "active": 1.725,
+        },
+    }
 
 
 @app.post("/api/vision/food")
@@ -665,8 +861,8 @@ def classify_by_user(payload: BodyTypeFromUserRequest, db: Session = Depends(get
         bmr_kcal=record.bmr,
     )
     result = classify_body_type(inbody_input)
-    record.predicted_cluster = None
-    record.cluster_name = result.stage2
+    record.predicted_classify = None
+    record.classify_name = result.stage2
     db.commit()
     return result
 

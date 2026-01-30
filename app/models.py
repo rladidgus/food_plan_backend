@@ -44,6 +44,7 @@ class UserProfile(Base):
     birth_date = Column(DateTime(timezone=True), nullable=True)  # 생년월일
     gender = Column(String(10), nullable=True)  # 성별
     goal_type = Column(String(20), nullable=True)  # diet/bulk/maintain 등
+    activity_level = Column(String(20), nullable=True)  # sedentary/light/moderate/active
     body_fat_percent = Column(Float, nullable=True)  # 체지방률
     skeletal_muscle_mass = Column(Float, nullable=True)  # 골격근량
     bmr = Column(Float, nullable=True)  # 기초대사량
@@ -171,8 +172,8 @@ class InBodyRecord(Base):
     bmr = Column(Float, nullable=True)                 # 기초대사량 (kcal)
     abdominal_fat_ratio = Column(Float, nullable=True)   # 복부지방률
     inbody_score = Column(Integer, nullable=True)      # 인바디점수
-    predicted_cluster = Column(Integer, nullable=True)  # 체형 클러스터 ID (선택)
-    cluster_name = Column(String(50), nullable=True)    # 체형 클러스터 이름 (선택)
+    predicted_classify = Column(Integer, nullable=True)  # 체형 분류 ID (선택)
+    classify_name = Column(String(50), nullable=True)    # 체형 분류 이름 (선택)
     source = Column(String(20), nullable=True)          # 입력 방식 (manual/ocr/csv)
     note = Column(String(255), nullable=True)           # 사용자 메모
 
