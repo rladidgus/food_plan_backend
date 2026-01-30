@@ -1,18 +1,30 @@
 import os
+import traceback
 import time
 import logging
 from datetime import date, datetime, timezone
 import gradio as gr
+from pathlib import Path
+from uuid import uuid4
+from datetime import datetime, timedelta
+from sqlalchemy import and_
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from app.food_lens import decide_food_gpt_only
 from app.database import get_db, engine, Base
-from app.models import Record, InBodyRecord, User, UserProfile, UserGoal, DailyActivity
-from typing import List, Optional
-from app.inbody_ocr import extract_key_values, format_key_values, upstage_ocr_from_bytes, update_user_inbody, build_demo
 from app.inbody import InbodyInput, BodyTypeResult, classify_body_type
+from app.models import Record, InBodyRecord, User, UserProfile, FoodAnalysisResult
+from typing import List, Optional
+from app import models
+from app.inbody_ocr import extract_key_values, format_key_values, upstage_ocr_from_bytes, update_user_inbody, build_demo
+from app.models import Record, InBodyRecord, User, UserProfile, UserGoal, DailyActivity
 from app.goal_rules import estimate_target_calory, normalize_activity_level, ACTIVITY_FACTORS
+
+UPLOAD_DIR = Path("uploads/foods")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # 환경 변수에서 DB 정보 가져오기
 DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -26,7 +38,8 @@ logger = logging.getLogger("app.sync")
 
 # Gradio OCR 데모 마운트 (카메라 기능 제공)
 ocr_demo = build_demo()
-app = gr.mount_gradio_app(app, ocr_demo, path="/ocr-web")
+gr.mount_gradio_app(app, ocr_demo, path="/ocr-web")
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 # CORS 설정 (Next.js 프론트엔드와 통신)
 app.add_middleware(
@@ -212,6 +225,7 @@ def _normalize_activity(item: DailyActivityIn) -> DailyActivityIn:
 
 class BodyTypeFromUserRequest(BaseModel):
     user_number: int
+
 
 
 # DB 테이블 생성
@@ -769,46 +783,112 @@ async def inbody_ocr(
     }
 
 
-@app.post("/api/vision/food")
-async def vision_food(image: UploadFile = File(...)):
-    import tempfile
-    import traceback
-    from app.food_lens import decide_food_gpt_only  # 함수 내부 또는 상단에서 임포트
-
-    print(f"▶ [API Start] /api/vision/food requested with file: {image.filename}")
-    
+@app.get("/api/record")
+def get_record(date: str, user_number: int = 3, db: Session = Depends(get_db)):
+    """
+    특정 날짜의 식단 기록 조회
+    - date: "YYYY-MM-DD"
+    - user_number: 테스트 기본값 3 (나중에 로그인 연동)
+    """
     try:
-        # 파일 임시 저장
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-            content = await image.read()
-            print(f"   - File size: {len(content)} bytes")
-            tmp.write(content)
-            tmp_path = tmp.name
+        day = datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="date는 YYYY-MM-DD 형식이어야 합니다.")
 
-        print(f"   - Temp file created at: {tmp_path}")
+    start = day
+    end = day + timedelta(days=1)
 
-        # 비전 분석 로직 실행
-        result = decide_food_gpt_only(tmp_path)
-        print("   - Recognition successful")
-        return result
+    rows = db.query(Record).filter(
+        Record.user_number == user_number,
+        Record.record_created_at >= start,
+        Record.record_created_at < end,
+    ).order_by(Record.record_created_at.desc()).all()
+
+    return [
+        {
+            "record_id": r.record_id,
+            "food_name": r.food_name,
+            "food_calories": r.food_calories,
+            "food_protein": r.food_protein,
+            "food_carbs": r.food_carbs,
+            "food_fats": r.food_fats,
+            "meal_type": r.meal_type,
+            "image_url": r.image_url,
+            "record_created_at": r.record_created_at.isoformat(),
+        }
+        for r in rows
+    ]
+@app.post("/api/vision/food")
+async def vision_food(
+    user_number: int = Form(...),
+    meal_type: str = Form(...),
+    image: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    try:
+        ext = (Path(image.filename).suffix or ".jpg").lower()
+        filename = f"{uuid4().hex}{ext}"
+        save_path = UPLOAD_DIR / filename
+
+        content = await image.read()
+        save_path.write_bytes(content)
+
+        image_url = f"/uploads/foods/{filename}"
+
+        result = decide_food_gpt_only(str(save_path))
+        decision = result["decision"]
+        nutrition = decision["nutrition"]
+
+        # 1) 분석 결과 저장
+        far = FoodAnalysisResult(
+            user_number=user_number,
+            image_url=image_url,
+            predicted_food_name=decision["chosen_food"],
+            predicted_reason=decision["reason"],
+            estimated_serving_g=None,
+            estimated_calories_kcal=nutrition.get("calories_kcal"),
+            estimated_carbs_g=nutrition.get("carbs_g"),
+            estimated_protein_g=nutrition.get("protein_g"),
+            estimated_fat_g=nutrition.get("fat_g"),
+            model="gpt-4.1-mini",
+            status="PENDING",
+        )
+        db.add(far)
+        db.commit()
+        db.refresh(far)
+
+        # 2) ✅ 화면 조회용 Record 저장 (GET /api/record가 이걸 가져감)
+        rec = Record(
+            user_number=user_number,
+            food_name=decision["chosen_food"],
+            food_calories=nutrition.get("calories_kcal"),
+            food_protein=nutrition.get("protein_g"),
+            food_carbs=nutrition.get("carbs_g"),
+            food_fats=nutrition.get("fat_g"),
+            meal_type=meal_type,
+            image_url=image_url,
+            record_created_at=datetime.utcnow(),
+        )
+        db.add(rec)
+        db.commit()
+        db.refresh(rec)
+
+        return {
+            "far_id": far.far_id,
+            "record_id": rec.record_id,
+            "status": far.status,
+            "image_url": image_url,
+            "decision": decision,
+        }
 
     except Exception as e:
-        # 에러 발생 시 콘솔에 상세 출력
         print("\n" + "="*60)
-        print(f"🚨 [Error] /api/vision/food failed!")
+        print("🚨 [Error] /api/vision/food failed!")
         print(f"   - Error Message: {e}")
         print("-" * 60)
-        print(traceback.format_exc())  # 에러 스택 트레이스 출력
+        print(traceback.format_exc())
         print("="*60 + "\n")
-        
-        # 클라이언트에게도 500 에러 전달
         raise HTTPException(status_code=500, detail=f"Vision API Error: {str(e)}")
-
-    finally:
-        # 임시 파일 삭제
-        if 'tmp_path' in locals() and os.path.exists(tmp_path):
-            os.remove(tmp_path)
-            print("   - Temp file deleted.")
             
             
 @app.post("/api/classify/bodytype", response_model=BodyTypeResult)
