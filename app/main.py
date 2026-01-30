@@ -1,8 +1,11 @@
 import os
+import traceback
 import time
 import gradio as gr
 from pathlib import Path
 from uuid import uuid4
+from datetime import datetime, timedelta
+from sqlalchemy import and_
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -15,9 +18,12 @@ from app import models
 from typing import List, Optional
 from app.inbody_ocr import extract_key_values, format_key_values, upstage_ocr_from_bytes, update_user_inbody, build_demo
 from app.inbody import InbodyInput, BodyTypeResult, classify_body_type
+from fastapi.staticfiles import StaticFiles
 
 UPLOAD_DIR = Path("uploads/foods")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
 
 # 환경 변수에서 DB 정보 가져오기
 DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -30,13 +36,13 @@ app = FastAPI(title="식단 계획 AI API")
 
 # Gradio OCR 데모 마운트 (카메라 기능 제공)
 ocr_demo = build_demo()
-app = gr.mount_gradio_app(app, ocr_demo, path="/ocr-web")
+gr.mount_gradio_app(app, ocr_demo, path="/ocr-web")
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 # CORS 설정 (Next.js 프론트엔드와 통신)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["localhost:3000"],  # 개발 및 테스트를 위해 모든 출처 허용
+    allow_origins=["*"],  # 개발 및 테스트를 위해 모든 출처 허용
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -92,6 +98,7 @@ class InBodyOcrResponse(BaseModel):
 
 class BodyTypeFromUserRequest(BaseModel):
     user_number: int
+
 
 
 # DB 테이블 생성
@@ -296,66 +303,100 @@ async def inbody_ocr(
     return {"raw_text": text, "text": format_key_values(values), "values": values, "updated": True}
 
 
+@app.get("/api/record")
+def get_record(date: str, user_number: int = 3, db: Session = Depends(get_db)):
+    """
+    특정 날짜의 식단 기록 조회
+    - date: "YYYY-MM-DD"
+    - user_number: 테스트 기본값 3 (나중에 로그인 연동)
+    """
+    try:
+        day = datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="date는 YYYY-MM-DD 형식이어야 합니다.")
+
+    start = day
+    end = day + timedelta(days=1)
+
+    rows = db.query(Record).filter(
+        Record.user_number == user_number,
+        Record.record_created_at >= start,
+        Record.record_created_at < end,
+    ).order_by(Record.record_created_at.desc()).all()
+
+    return [
+        {
+            "record_id": r.record_id,
+            "food_name": r.food_name,
+            "food_calories": r.food_calories,
+            "food_protein": r.food_protein,
+            "food_carbs": r.food_carbs,
+            "food_fats": r.food_fats,
+            "meal_type": r.meal_type,
+            "image_url": r.image_url,
+            "record_created_at": r.record_created_at.isoformat(),
+        }
+        for r in rows
+    ]
 @app.post("/api/vision/food")
 async def vision_food(
     user_number: int = Form(...),
+    meal_type: str = Form(...),
     image: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
-    import traceback
-
-    print(f"▶ [API Start] /api/vision/food requested with file: {image.filename}")
-
     try:
-        # 1) 업로드 파일 영구 저장
         ext = (Path(image.filename).suffix or ".jpg").lower()
         filename = f"{uuid4().hex}{ext}"
         save_path = UPLOAD_DIR / filename
 
         content = await image.read()
-        print(f"   - File size: {len(content)} bytes")
-
         save_path.write_bytes(content)
 
-        # 프론트/클라이언트에 반환할 경로(규칙은 프로젝트에 맞춰 통일)
         image_url = f"/uploads/foods/{filename}"
-        print(f"   - Saved file at: {save_path}")
-        print(f"   - image_url: {image_url}")
 
-        # 2) GPT 비전 분석 실행 (로컬 파일 경로로 분석)
         result = decide_food_gpt_only(str(save_path))
-        print("   - Recognition successful")
-
         decision = result["decision"]
         nutrition = decision["nutrition"]
 
-        # 3) DB INSERT (임시 분석 결과 저장)
-        row = FoodAnalysisResult(
+        # 1) 분석 결과 저장
+        far = FoodAnalysisResult(
             user_number=user_number,
             image_url=image_url,
             predicted_food_name=decision["chosen_food"],
             predicted_reason=decision["reason"],
-
-            # 현재 food_lens.py 스키마는 serving_description 문자열만 있음 → g는 일단 None
             estimated_serving_g=None,
-
             estimated_calories_kcal=nutrition.get("calories_kcal"),
             estimated_carbs_g=nutrition.get("carbs_g"),
             estimated_protein_g=nutrition.get("protein_g"),
             estimated_fat_g=nutrition.get("fat_g"),
-
             model="gpt-4.1-mini",
             status="PENDING",
         )
-
-        db.add(row)
+        db.add(far)
         db.commit()
-        db.refresh(row)
+        db.refresh(far)
 
-        # 4) 응답 (프론트가 나중에 확정할 때 far_id 필요)
+        # 2) ✅ 화면 조회용 Record 저장 (GET /api/record가 이걸 가져감)
+        rec = Record(
+            user_number=user_number,
+            food_name=decision["chosen_food"],
+            food_calories=nutrition.get("calories_kcal"),
+            food_protein=nutrition.get("protein_g"),
+            food_carbs=nutrition.get("carbs_g"),
+            food_fats=nutrition.get("fat_g"),
+            meal_type=meal_type,
+            image_url=image_url,
+            record_created_at=datetime.utcnow(),
+        )
+        db.add(rec)
+        db.commit()
+        db.refresh(rec)
+
         return {
-            "far_id": row.far_id,
-            "status": row.status,
+            "far_id": far.far_id,
+            "record_id": rec.record_id,
+            "status": far.status,
             "image_url": image_url,
             "decision": decision,
         }
