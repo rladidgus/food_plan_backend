@@ -12,7 +12,9 @@ import requests
 from dotenv import load_dotenv
 from PIL import Image
 from app.database import SessionLocal
-from app.models import User, UserProfile, InBodyRecord, BMIHistory
+from app.models import User, UserProfile, InBodyRecord, BMIHistory, UserGoal
+from app.inbody import InbodyInput, classify_body_type
+from app.goal_rules import infer_goal_type, estimate_target_calory, normalize_activity_level
 
 # 1) 환경변수 로드 (.env에 UPSTAGE_API_KEY=... 넣어두면 됨)
 load_dotenv(override=False)
@@ -348,6 +350,15 @@ def update_user_inbody(user_number: int, values: dict) -> None:
         if "bmr" in values:
             profile.bmr = values["bmr"]
 
+        gender_value = values.get("gender") or profile.gender
+        sex: Optional[str] = None
+        if gender_value:
+            gender_raw = str(gender_value).strip().lower()
+            if gender_raw in ("m", "male", "남", "남성"):
+                sex = "M"
+            elif gender_raw in ("f", "female", "여", "여성"):
+                sex = "F"
+
         # InBodyRecord 저장 (이력 관리)
         new_record = InBodyRecord(
             user_number=user.user_number,
@@ -362,6 +373,58 @@ def update_user_inbody(user_number: int, values: dict) -> None:
             source="ocr",
             # 기타 항목은 나중에 확장
         )
+
+        required_fields = {
+            "height": new_record.height,
+            "weight": new_record.weight,
+            "body_fat_mass": new_record.body_fat_mass,
+            "body_fat_pct": new_record.body_fat_pct,
+            "skeletal_muscle_mass": new_record.skeletal_muscle_mass,
+        }
+        if sex and all(value is not None for value in required_fields.values()):
+            inbody_input = InbodyInput(
+                sex=sex,
+                height_cm=new_record.height,
+                weight_kg=new_record.weight,
+                body_fat_kg=new_record.body_fat_mass,
+                body_fat_pct=new_record.body_fat_pct,
+                skeletal_muscle_kg=new_record.skeletal_muscle_mass,
+                bmr_kcal=new_record.bmr,
+            )
+            result = classify_body_type(inbody_input)
+            new_record.predicted_classify = None
+            new_record.classify_name = result.stage2
+
+            goal_type = infer_goal_type(result.stage1, result.stage2)
+            target_calory = estimate_target_calory(
+                goal_type=goal_type,
+                bmr_kcal=new_record.bmr,
+                weight_kg=new_record.weight,
+                activity_level=normalize_activity_level(profile.activity_level) if profile else None,
+            )
+            latest_goal = (
+                db.query(UserGoal)
+                .filter(UserGoal.user_number == user.user_number)
+                .order_by(UserGoal.created_at.desc())
+                .first()
+            )
+            if latest_goal:
+                latest_goal.goal_type = goal_type
+                latest_goal.target_calory = target_calory
+                latest_goal.start_date = datetime.now(timezone.utc)
+            else:
+                latest_goal = UserGoal(
+                    user_number=user.user_number,
+                    id=user.id,
+                    goal_type=goal_type,
+                    target_calory=target_calory,
+                    start_date=datetime.now(timezone.utc),
+                )
+                db.add(latest_goal)
+
+            if profile:
+                profile.goal_type = goal_type
+
         db.add(new_record)
 
         # BMIHistory 저장
