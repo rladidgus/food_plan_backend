@@ -111,7 +111,9 @@ class MyPageResponse(BaseModel):
 
 class MyPageEnvelopeResponse(BaseModel):
     """마이페이지 응답 모델 (목표 + 식단 기록)"""
+    user: Optional[UserResponse] = None
     goal: Optional[UserGoalResponse] = None
+    body: Optional[dict] = None
     records: List[MyPageResponse]
     diet_plan: Optional[dict] = None
 
@@ -263,6 +265,10 @@ class AuthResponse(BaseModel):
     username: str
     message: str
 
+
+class LogoutResponse(BaseModel):
+    message: str
+
 @app.post("/api/register", response_model=AuthResponse)
 def register(user_data: UserCreate, db: Session = Depends(get_db)):
     """회원가입"""
@@ -317,10 +323,19 @@ def login(user_data: UserLogin, db: Session = Depends(get_db)):
     }
 
 
+@app.post("/api/logout", response_model=LogoutResponse)
+def logout():
+    """로그아웃 (서버 상태 없음)"""
+    return {"message": "로그아웃 성공"}
+
+
 @app.get("/api/user", response_model=UserResponse)
-def get_user(user_number: int = 1, db: Session = Depends(get_db)):
+def get_user(id: Optional[str] = None, user_number: int = 1, db: Session = Depends(get_db)):
     """사용자 기본 정보 조회"""
-    user = db.query(User).filter(User.user_number == user_number).first()
+    if id:
+        user = db.query(User).filter(User.id == id).first()
+    else:
+        user = db.query(User).filter(User.user_number == user_number).first()
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="사용자를 찾을 수 없습니다.")
     return {
@@ -339,6 +354,18 @@ def get_user_goal(user_number: int = 1, db: Session = Depends(get_db)):
         db.query(UserGoal)
         .filter(UserGoal.user_number == user_number)
         .order_by(UserGoal.created_at.desc())
+        .first()
+    )
+    diet_plan = (
+        db.query(UserDietPlan)
+        .filter(UserDietPlan.user_number == user_number)
+        .order_by(UserDietPlan.created_at.desc())
+        .first()
+    )
+    diet_plan = (
+        db.query(UserDietPlan)
+        .filter(UserDietPlan.user_number == user_number)
+        .order_by(UserDietPlan.created_at.desc())
         .first()
     )
     diet_plan = (
@@ -534,8 +561,19 @@ def get_latest_inbody(user_number: int = 1, db: Session = Depends(get_db)):
 
 
 @app.get("/api/mypage", response_model=MyPageEnvelopeResponse)
-def get_mypage_records(user_number: int = 1, limit: int = 10, db: Session = Depends(get_db)):
+def get_mypage_records(id: Optional[str] = None, user_number: int = 1, limit: int = 10, db: Session = Depends(get_db)):
     """마이페이지 식단 기록 조회"""
+    if id:
+        user = db.query(User).filter(User.id == id).first()
+        if not user:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="사용자를 찾을 수 없습니다.")
+        user_number = user.user_number
+    else:
+        user = (
+            db.query(User)
+            .filter(User.user_number == user_number)
+            .first()
+        )
     latest_inbody = (
         db.query(InBodyRecord)
         .filter(InBodyRecord.user_number == user_number)
@@ -573,6 +611,23 @@ def get_mypage_records(user_number: int = 1, limit: int = 10, db: Session = Depe
         .all()
     )
     return {
+        "user": (
+            {
+                "user_number": user.user_number,
+                "id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "role": user.role,
+            }
+            if user
+            else None
+        ),
+        "body": {
+            "height": height,
+            "weight": weight,
+            "skeletal_muscle_mass": skeletal_muscle_mass,
+            "body_fat_percent": body_fat_percent,
+        },
         "goal": (
             {
                 "goal_id": goal.goal_id,
@@ -756,13 +811,22 @@ def get_inbody_history(user_number: int = 1, limit: int = 10, db: Session = Depe
 
 @app.post("/api/inbody-ocr", response_model=InBodyOcrResponse)
 async def inbody_ocr(
-    user_number: int = Form(1),  # 기본값 1 (테스트용)
+    id: Optional[str] = Form(None),
+    user_number: Optional[int] = Form(None),
     image: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
     """
     인바디 사진 OCR -> 핵심 항목 추출 -> users 테이블 최신값 업데이트
     """
+    if id:
+        user = db.query(User).filter(User.id == id).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
+        user_number = user.user_number
+    if user_number is None:
+        raise HTTPException(status_code=400, detail="user_number 또는 id가 필요합니다.")
+
     if not image.content_type or not image.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="이미지 파일만 업로드 가능합니다.")
 
