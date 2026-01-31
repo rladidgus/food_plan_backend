@@ -4,14 +4,14 @@ from typing import Dict, Any, Literal, Optional
 from pydantic import BaseModel, Field, model_validator
 
 
-Sex = Literal["M", "F"]
+Gender = Literal["M", "F"]
 
 
 # -----------------------------
 # 1) Input / Output Schemas
 # -----------------------------
 class InbodyInput(BaseModel):
-    sex: Sex = Field(description="M(남) 또는 F(여)")
+    gender: Gender = Field(description="M(남) 또는 F(여)")
     height_cm: float = Field(gt=50, lt=250, description="키(cm)")
     weight_kg: float = Field(gt=10, lt=400, description="체중(kg)")
 
@@ -50,7 +50,7 @@ class BodyTypeResult(BaseModel):
 # -----------------------------
 # 2) Thresholds
 # -----------------------------
-def thresholds(sex: Sex) -> Dict[str, Any]:
+def thresholds(gender: Gender) -> Dict[str, Any]:
     """
     운영용 현실 기준 (룰 기반)
     - BMI: 아시아 기준 정상 18.5~22.9, 비만 25+
@@ -64,7 +64,7 @@ def thresholds(sex: Sex) -> Dict[str, Any]:
         남: 저근육 <17, 근육형 기준 >=19, 고근육 >=22
         여: 저근육 <15, 근육형 기준 >=17, 고근육 >=20
     """
-    if sex == "M":
+    if gender == "M":
         return dict(
             bf_normal_max=20.0,
             bf_obese_min=25.0,
@@ -132,7 +132,7 @@ def compute_metrics(x: InbodyInput) -> Dict[str, float]:
 # 4) Stage 1 Classifier
 # -----------------------------
 def classify_stage1(x: InbodyInput, m: Dict[str, float]) -> Stage1:
-    th = thresholds(x.sex)
+    th = thresholds(x.gender)
     bmi = m["bmi"]
     bf = m["body_fat_pct"]
 
@@ -152,7 +152,7 @@ def classify_stage1(x: InbodyInput, m: Dict[str, float]) -> Stage1:
 # 5) Stage 2 Classifier
 # -----------------------------
 def classify_stage2(x: InbodyInput, m: Dict[str, float], stage1: Stage1) -> tuple[Stage2, str]:
-    th = thresholds(x.sex)
+    th = thresholds(x.gender)
 
     bmi = m["bmi"]
     bf = m["body_fat_pct"]

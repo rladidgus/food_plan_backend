@@ -352,13 +352,13 @@ def update_user_inbody(user_number: int, values: dict) -> None:
             profile.bmr = values["bmr"]
 
         gender_value = values.get("gender") or profile.gender
-        sex: Optional[str] = None
+        gender: Optional[str] = None
         if gender_value:
             gender_raw = str(gender_value).strip().lower()
             if gender_raw in ("m", "male", "남", "남성"):
-                sex = "M"
+                gender = "M"
             elif gender_raw in ("f", "female", "여", "여성"):
-                sex = "F"
+                gender = "F"
 
         # InBodyRecord 저장 (이력 관리)
         new_record = InBodyRecord(
@@ -382,9 +382,9 @@ def update_user_inbody(user_number: int, values: dict) -> None:
             "body_fat_pct": new_record.body_fat_pct,
             "skeletal_muscle_mass": new_record.skeletal_muscle_mass,
         }
-        if sex and all(value is not None for value in required_fields.values()):
+        if gender and all(value is not None for value in required_fields.values()):
             inbody_input = InbodyInput(
-                sex=sex,
+                gender=gender,
                 height_cm=new_record.height,
                 weight_kg=new_record.weight,
                 body_fat_kg=new_record.body_fat_mass,
