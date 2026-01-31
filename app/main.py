@@ -9,9 +9,10 @@ from pathlib import Path
 from uuid import uuid4
 from datetime import datetime, timedelta
 from sqlalchemy import and_
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, status
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from app.food_lens import decide_food_gpt_only
@@ -43,13 +44,24 @@ ocr_demo = build_demo()
 gr.mount_gradio_app(app, ocr_demo, path="/ocr-web")
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
+FRONTEND_ORIGINS = os.getenv("FRONTEND_ORIGINS", "http://localhost:3000").split(",")
+SESSION_SECRET = os.getenv("SESSION_SECRET", "dev-secret")
+
 # CORS 설정 (Next.js 프론트엔드와 통신)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 개발 및 테스트를 위해 모든 출처 허용
+    allow_origins=[origin.strip() for origin in FRONTEND_ORIGINS if origin.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+)
+
+# 세션 기반 로그인 (쿠키)
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=SESSION_SECRET,
+    same_site="lax",
+    https_only=False,
 )
 
 # Pydantic 모델 (요청/응답 스키마)
@@ -269,6 +281,31 @@ class AuthResponse(BaseModel):
 class LogoutResponse(BaseModel):
     message: str
 
+
+def _resolve_user_from_session_or_params(
+    request: Request,
+    db: Session,
+    id: Optional[str],
+    user_number: Optional[int],
+) -> User:
+    session_user_id = request.session.get("user_id")
+    if session_user_id:
+        user = db.query(User).filter(User.id == session_user_id).first()
+        if not user:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="세션이 유효하지 않습니다.")
+        return user
+
+    if id:
+        user = db.query(User).filter(User.id == id).first()
+    elif user_number is not None:
+        user = db.query(User).filter(User.user_number == user_number).first()
+    else:
+        user = None
+
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="로그인이 필요합니다.")
+    return user
+
 @app.post("/api/register", response_model=AuthResponse)
 def register(user_data: UserCreate, db: Session = Depends(get_db)):
     """회원가입"""
@@ -298,7 +335,7 @@ def register(user_data: UserCreate, db: Session = Depends(get_db)):
     }
 
 @app.post("/api/login", response_model=AuthResponse)
-def login(user_data: UserLogin, db: Session = Depends(get_db)):
+def login(user_data: UserLogin, request: Request, db: Session = Depends(get_db)):
     """로그인"""
     # 로그인 아이디(id)로 사용자 검색
     user = db.query(User).filter(User.id == user_data.id).first()
@@ -314,7 +351,10 @@ def login(user_data: UserLogin, db: Session = Depends(get_db)):
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="아이디 또는 비밀번호가 올바르지 않습니다."
         )
-    
+
+    request.session["user_id"] = user.id
+    request.session["user_number"] = user.user_number
+
     return {
         "user_number": user.user_number,
         "id": user.id,
@@ -324,18 +364,16 @@ def login(user_data: UserLogin, db: Session = Depends(get_db)):
 
 
 @app.post("/api/logout", response_model=LogoutResponse)
-def logout():
+def logout(request: Request):
     """로그아웃 (서버 상태 없음)"""
+    request.session.clear()
     return {"message": "로그아웃 성공"}
 
 
 @app.get("/api/user", response_model=UserResponse)
-def get_user(id: Optional[str] = None, user_number: int = 1, db: Session = Depends(get_db)):
+def get_user(request: Request, id: Optional[str] = None, user_number: int = 1, db: Session = Depends(get_db)):
     """사용자 기본 정보 조회"""
-    if id:
-        user = db.query(User).filter(User.id == id).first()
-    else:
-        user = db.query(User).filter(User.user_number == user_number).first()
+    user = _resolve_user_from_session_or_params(request, db, id, user_number)
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="사용자를 찾을 수 없습니다.")
     return {
@@ -348,11 +386,12 @@ def get_user(id: Optional[str] = None, user_number: int = 1, db: Session = Depen
 
 
 @app.get("/api/user/goal", response_model=UserGoalResponse)
-def get_user_goal(user_number: int = 1, db: Session = Depends(get_db)):
+def get_user_goal(request: Request, user_number: int = 1, db: Session = Depends(get_db)):
     """사용자 목표 조회"""
+    user = _resolve_user_from_session_or_params(request, db, None, user_number)
     goal = (
         db.query(UserGoal)
-        .filter(UserGoal.user_number == user_number)
+        .filter(UserGoal.user_number == user.user_number)
         .order_by(UserGoal.created_at.desc())
         .first()
     )
@@ -526,11 +565,12 @@ def update_activity_level(payload: ActivityLevelUpdateRequest, db: Session = Dep
 
 
 @app.get("/api/inbody", response_model=Optional[InBodyHistoryResponse])
-def get_latest_inbody(user_number: int = 1, db: Session = Depends(get_db)):
+def get_latest_inbody(request: Request, user_number: int = 1, db: Session = Depends(get_db)):
     """사용자 최신 인바디 기록 조회"""
+    user = _resolve_user_from_session_or_params(request, db, None, user_number)
     record = (
         db.query(InBodyRecord)
-        .filter(InBodyRecord.user_number == user_number)
+        .filter(InBodyRecord.user_number == user.user_number)
         .order_by(InBodyRecord.created_at.desc())
         .first()
     )
@@ -561,19 +601,16 @@ def get_latest_inbody(user_number: int = 1, db: Session = Depends(get_db)):
 
 
 @app.get("/api/mypage", response_model=MyPageEnvelopeResponse)
-def get_mypage_records(id: Optional[str] = None, user_number: int = 1, limit: int = 10, db: Session = Depends(get_db)):
+def get_mypage_records(
+    request: Request,
+    id: Optional[str] = None,
+    user_number: int = 1,
+    limit: int = 10,
+    db: Session = Depends(get_db),
+):
     """마이페이지 식단 기록 조회"""
-    if id:
-        user = db.query(User).filter(User.id == id).first()
-        if not user:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="사용자를 찾을 수 없습니다.")
-        user_number = user.user_number
-    else:
-        user = (
-            db.query(User)
-            .filter(User.user_number == user_number)
-            .first()
-        )
+    user = _resolve_user_from_session_or_params(request, db, id, user_number)
+    user_number = user.user_number
     latest_inbody = (
         db.query(InBodyRecord)
         .filter(InBodyRecord.user_number == user_number)
@@ -774,12 +811,13 @@ def sync_health_connect_activities(
 
 
 @app.get("/api/inbody-history", response_model=List[InBodyHistoryResponse])
-def get_inbody_history(user_number: int = 1, limit: int = 10, db: Session = Depends(get_db)):
+def get_inbody_history(request: Request, user_number: int = 1, limit: int = 10, db: Session = Depends(get_db)):
     """
     사용자의 인바디 측정 히스토리 조회
     """
+    user = _resolve_user_from_session_or_params(request, db, None, user_number)
     records = db.query(InBodyRecord).filter(
-        InBodyRecord.user_number == user_number
+        InBodyRecord.user_number == user.user_number
     ).order_by(InBodyRecord.created_at.desc()).limit(limit).all()
     
     return [
@@ -811,6 +849,7 @@ def get_inbody_history(user_number: int = 1, limit: int = 10, db: Session = Depe
 
 @app.post("/api/inbody-ocr", response_model=InBodyOcrResponse)
 async def inbody_ocr(
+    request: Request,
     id: Optional[str] = Form(None),
     user_number: Optional[int] = Form(None),
     image: UploadFile = File(...),
@@ -819,13 +858,8 @@ async def inbody_ocr(
     """
     인바디 사진 OCR -> 핵심 항목 추출 -> users 테이블 최신값 업데이트
     """
-    if id:
-        user = db.query(User).filter(User.id == id).first()
-        if not user:
-            raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
-        user_number = user.user_number
-    if user_number is None:
-        raise HTTPException(status_code=400, detail="user_number 또는 id가 필요합니다.")
+    user = _resolve_user_from_session_or_params(request, db, id, user_number)
+    user_number = user.user_number
 
     if not image.content_type or not image.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="이미지 파일만 업로드 가능합니다.")
@@ -1028,9 +1062,9 @@ def classify_by_user(payload: BodyTypeFromUserRequest, db: Session = Depends(get
 
     gender_raw = str(profile.gender).strip().lower()
     if gender_raw in ("m", "male", "남", "남성"):
-        sex = "M"
+        gender = "M"
     elif gender_raw in ("f", "female", "여", "여성"):
-        sex = "F"
+        gender = "F"
     else:
         raise HTTPException(status_code=400, detail="프로필 성별 정보가 올바르지 않습니다.")
 
@@ -1046,7 +1080,7 @@ def classify_by_user(payload: BodyTypeFromUserRequest, db: Session = Depends(get
         raise HTTPException(status_code=400, detail=f"인바디 기록 값이 부족합니다: {', '.join(missing)}")
 
     inbody_input = InbodyInput(
-        sex=sex,
+        gender=gender,
         height_cm=record.height,
         weight_kg=record.weight,
         body_fat_kg=record.body_fat_mass,
