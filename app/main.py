@@ -3,7 +3,7 @@ import traceback
 import time
 import logging
 import time as time_module
-from datetime import date, datetime, timezone, time, timedelta as dt_time
+from datetime import date, datetime, timezone, time as dt_time, timedelta as dt_timedelta
 from pathlib import Path
 from uuid import uuid4
 from datetime import datetime, timedelta
@@ -1041,7 +1041,7 @@ def get_record(date: str, user_number: int = 3, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="date는 YYYY-MM-DD 형식이어야 합니다.")
 
     start = day
-    end = day + timedelta(days=1)
+    end = day + dt_timedelta(days=1)
 
     rows = db.query(Record).filter(
         Record.user_number == user_number,
