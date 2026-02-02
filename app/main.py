@@ -1,10 +1,9 @@
 import os
-import json
 import traceback
 import time
 import logging
-from datetime import date, datetime, timezone, time as dt_time
-import gradio as gr
+import time as time_module
+from datetime import date, datetime, timezone, time, timedelta as dt_time
 from pathlib import Path
 from uuid import uuid4
 from datetime import datetime, timedelta
@@ -21,10 +20,21 @@ from app.inbody import InbodyInput, BodyTypeResult, classify_body_type
 from app.models import Record, InBodyRecord, User, UserProfile, FoodAnalysisResult
 from typing import List, Optional
 from app import models
-from app.inbody_ocr import extract_key_values, format_key_values, upstage_ocr_from_bytes, update_user_inbody, build_demo
-from app.models import Record, InBodyRecord, User, UserProfile, UserGoal, DailyActivity, UserDietPlan
+from app.inbody_ocr import extract_key_values, format_key_values, upstage_ocr_from_bytes, update_user_inbody
+from app.models import Record, InBodyRecord, User, UserProfile, UserGoal, DailyActivity
 from app.goal_rules import estimate_target_calorie, normalize_activity_level, ACTIVITY_FACTORS
-from app.diet_plan import create_diet_plan_record
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from supabase import create_client, Client
+
+# Supabase 클라이언트 초기화
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError("SUPABASE_URL / SUPABASE_KEY 환경변수가 필요합니다.")
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+security = HTTPBearer()
 
 UPLOAD_DIR = Path("uploads/foods")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -39,9 +49,6 @@ DB_PASS = os.getenv("DB_PASS", "password")
 app = FastAPI(title="식단 계획 AI API")
 logger = logging.getLogger("app.sync")
 
-# Gradio OCR 데모 마운트 (카메라 기능 제공)
-ocr_demo = build_demo()
-gr.mount_gradio_app(app, ocr_demo, path="/ocr-web")
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 FRONTEND_ORIGINS = os.getenv("FRONTEND_ORIGINS", "http://localhost:3000").split(",")
@@ -127,7 +134,6 @@ class MyPageEnvelopeResponse(BaseModel):
     goal: Optional[UserGoalResponse] = None
     body: Optional[dict] = None
     records: List[MyPageResponse]
-    diet_plan: Optional[dict] = None
 
 
 class UserGoalUpdateRequest(BaseModel):
@@ -136,14 +142,6 @@ class UserGoalUpdateRequest(BaseModel):
     goal_type: str
     target_calorie: Optional[float] = None
 
-
-class DietPlanResponse(BaseModel):
-    plan_id: int
-    user_number: int
-    goal_type: str
-    target_calorie: Optional[float] = None
-    plan: dict
-    created_at: Optional[str] = None
 
 
 class ActivityLevelUpdateRequest(BaseModel):
@@ -248,7 +246,7 @@ class BodyTypeFromUserRequest(BaseModel):
 def startup_event():
     """애플리케이션 시작 시 DB 테이블 생성"""
     print("🚀 FastAPI 서버 시작 중...")
-    time.sleep(3)  # DB가 준비될 때까지 대기
+    time_module.sleep(3)  # DB가 준비될 때까지 대기
     Base.metadata.create_all(bind=engine)
     print("✅ 데이터베이스 초기화 완료")
 
@@ -279,6 +277,12 @@ class AuthResponse(BaseModel):
 
 
 class LogoutResponse(BaseModel):
+    message: str
+
+
+class RecordDeleteResponse(BaseModel):
+    """식단 기록 삭제 응답"""
+    record_id: int
     message: str
 
 
@@ -362,6 +366,78 @@ def login(user_data: UserLogin, request: Request, db: Session = Depends(get_db))
         "message": "로그인 성공"
     }
 
+async def get_current_user_from_token(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db)
+) -> User:
+    """
+    Supabase 토큰을 검증하고 해당하는 로컬 DB 사용자를 반환
+    (없으면 자동 회원가입)
+    """
+    token = credentials.credentials
+    
+    try:
+        # 1. Supabase에 토큰 검증 요청
+        user_response = supabase.auth.get_user(token)
+        user_data = user_response.user
+        
+        if not user_data:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="유효하지 않은 토큰입니다.")
+        
+        # 2. 로컬 DB에서 사용자 조회
+        # social_id (uid)로 조회
+        provider_user_id = user_data.id
+        email = user_data.email
+        
+        existing_user = db.query(User).filter(User.provider_user_id == provider_user_id).first()
+        
+        if existing_user:
+            return existing_user
+            
+        # 3. 없으면 자동 회원가입 진행
+        # ID는 이메일이나 난수로 생성, 비밀번호는 사용 안 함(Dummy)
+        new_username = user_data.user_metadata.get("full_name") or user_data.user_metadata.get("name") or email.split("@")[0]
+        
+        new_user = User(
+            id=email, # 소셜 로그인은 이메일을 ID로 사용하거나 UUID 사용
+            username=new_username,
+            password=uuid4().hex, # 비밀번호는 랜덤으로 설정 (로그인에 사용 안 함)
+            provider_user_id=provider_user_id,
+            email=email,
+            role="user"
+        )
+        db.add(new_user)
+        db.commit()
+        db.refresh(new_user)
+        
+        # 프로필도 함께 생성
+        new_profile = UserProfile(
+            user_number=new_user.user_number
+        )
+        db.add(new_profile)
+        db.commit()
+        
+        return new_user
+        
+    except Exception as e:
+        print(f"Token verification failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="인증에 실패했습니다."
+        )
+
+@app.get("/api/me", response_model=AuthResponse)
+def read_users_me(current_user: User = Depends(get_current_user_from_token)):
+    """
+    현재 로그인된(토큰) 사용자 정보 조회
+    """
+    return {
+        "user_number": current_user.user_number,
+        "id": current_user.id,
+        "username": current_user.username,
+        "message": "사용자 정보를 성공적으로 불러왔습니다."
+    }
+
 
 @app.post("/api/logout", response_model=LogoutResponse)
 def logout(request: Request):
@@ -393,24 +469,6 @@ def get_user_goal(request: Request, user_number: int = 1, db: Session = Depends(
         db.query(UserGoal)
         .filter(UserGoal.user_number == user.user_number)
         .order_by(UserGoal.created_at.desc())
-        .first()
-    )
-    diet_plan = (
-        db.query(UserDietPlan)
-        .filter(UserDietPlan.user_number == user_number)
-        .order_by(UserDietPlan.created_at.desc())
-        .first()
-    )
-    diet_plan = (
-        db.query(UserDietPlan)
-        .filter(UserDietPlan.user_number == user_number)
-        .order_by(UserDietPlan.created_at.desc())
-        .first()
-    )
-    diet_plan = (
-        db.query(UserDietPlan)
-        .filter(UserDietPlan.user_number == user_number)
-        .order_by(UserDietPlan.created_at.desc())
         .first()
     )
     if not goal:
@@ -499,14 +557,6 @@ def upsert_user_goal(payload: UserGoalUpdateRequest, db: Session = Depends(get_d
 
     if profile:
         profile.goal_type = goal_type
-    if target_calorie is not None:
-        create_diet_plan_record(
-            db=db,
-            user_number=payload.user_number,
-            goal_type=goal_type,
-            target_calorie=target_calorie,
-        )
-
     db.commit()
     return {
         "goal_id": goal.goal_id,
@@ -520,27 +570,6 @@ def upsert_user_goal(payload: UserGoalUpdateRequest, db: Session = Depends(get_d
         "start_date": goal.start_date.isoformat() if goal.start_date else None,
         "end_date": goal.end_date.isoformat() if goal.end_date else None,
         "created_at": goal.created_at.isoformat() if goal.created_at else None,
-    }
-
-
-@app.get("/api/user/diet-plan", response_model=Optional[DietPlanResponse])
-def get_latest_diet_plan(user_number: int = 1, db: Session = Depends(get_db)):
-    """사용자의 최신 목표 식단 계획 조회"""
-    plan = (
-        db.query(UserDietPlan)
-        .filter(UserDietPlan.user_number == user_number)
-        .order_by(UserDietPlan.created_at.desc())
-        .first()
-    )
-    if not plan:
-        return None
-    return {
-        "plan_id": plan.plan_id,
-        "user_number": plan.user_number,
-        "goal_type": plan.goal_type,
-        "target_calorie": plan.target_calorie,
-        "plan": json.loads(plan.plan_json),
-        "created_at": plan.created_at.isoformat() if plan.created_at else None,
     }
 
 
@@ -680,11 +709,6 @@ def get_mypage_records(
                 "created_at": goal.created_at.isoformat() if goal.created_at else None,
             }
             if goal
-            else None
-        ),
-        "diet_plan": (
-            json.loads(diet_plan.plan_json)
-            if diet_plan and diet_plan.plan_json
             else None
         ),
         "records": [
@@ -922,6 +946,81 @@ async def inbody_ocr(
     }
 
 
+@app.post("/api/inbody-ocr/upload", response_model=InBodyOcrResponse)
+async def inbody_ocr_upload(
+    request: Request,
+    id: Optional[str] = Form(None),
+    user_number: Optional[int] = Form(None),
+    image: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """
+    인바디 사진 OCR -> 핵심 항목 추출 -> users 테이블 최신값 업데이트
+    """
+    user = _resolve_user_from_session_or_params(request, db, id, user_number)
+    user_number = user.user_number
+
+    if not image.content_type or not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="이미지 파일만 업로드 가능합니다.")
+
+    content = await image.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="이미지 파일이 비어 있습니다.")
+
+    text = upstage_ocr_from_bytes(
+        content,
+        filename=image.filename or "inbody.jpg",
+        mime=image.content_type or "image/jpeg",
+    )
+    values = extract_key_values(text)
+
+    if not values:
+        profile = (
+            db.query(UserProfile)
+            .filter(UserProfile.user_number == user_number)
+            .first()
+        )
+        return {
+            "raw_text": text,
+            "text": "",
+            "values": {},
+            "updated": False,
+            "activity_level": profile.activity_level if profile else None,
+            "activity_level_options": {
+                "sedentary": 1.2,
+                "light": 1.375,
+                "moderate": 1.55,
+                "active": 1.725,
+            },
+        }
+
+    try:
+        update_user_inbody(user_number, values)
+    except RuntimeError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DB 업데이트 실패: {e}")
+
+    profile = (
+        db.query(UserProfile)
+        .filter(UserProfile.user_number == user_number)
+        .first()
+    )
+    return {
+        "raw_text": text,
+        "text": format_key_values(values),
+        "values": values,
+        "updated": True,
+        "activity_level": profile.activity_level if profile else None,
+        "activity_level_options": {
+            "sedentary": 1.2,
+            "light": 1.375,
+            "moderate": 1.55,
+            "active": 1.725,
+        },
+    }
+
+
 @app.get("/api/record")
 def get_record(date: str, user_number: int = 3, db: Session = Depends(get_db)):
     """
@@ -957,6 +1056,30 @@ def get_record(date: str, user_number: int = 3, db: Session = Depends(get_db)):
         }
         for r in rows
     ]
+
+
+@app.delete("/api/record/{record_id}", response_model=RecordDeleteResponse)
+def delete_record(
+    record_id: int,
+    request: Request,
+    id: Optional[str] = None,
+    user_number: int = 1,
+    db: Session = Depends(get_db),
+):
+    """식단 기록 삭제"""
+    user = _resolve_user_from_session_or_params(request, db, id, user_number)
+    record = (
+        db.query(Record)
+        .filter(Record.record_id == record_id, Record.user_number == user.user_number)
+        .first()
+    )
+    if not record:
+        raise HTTPException(status_code=404, detail="식단 기록을 찾을 수 없습니다.")
+
+    db.delete(record)
+    db.commit()
+
+    return {"record_id": record_id, "message": "식단 기록이 삭제되었습니다."}
 @app.post("/api/vision/food")
 async def vision_food(
     user_number: int = Form(...),

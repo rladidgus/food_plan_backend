@@ -19,3 +19,4 @@ bcrypt
 pillow
 openai>=1.40.0
 clarifai
+supabase
