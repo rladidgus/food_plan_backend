@@ -51,13 +51,20 @@ logger = logging.getLogger("app.sync")
 
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
-FRONTEND_ORIGINS = os.getenv("FRONTEND_ORIGINS", "http://localhost:3000").split(",")
+FRONTEND_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "FRONTEND_ORIGINS",
+        "http://localhost:3000"
+    ).split(",")
+    if origin.strip()
+]
 SESSION_SECRET = os.getenv("SESSION_SECRET", "dev-secret")
 
 # CORS 설정 (Next.js 프론트엔드와 통신)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[origin.strip() for origin in FRONTEND_ORIGINS if origin.strip()],
+    allow_origins=FRONTEND_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
