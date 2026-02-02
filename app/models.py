@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Float, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, Date, Float, ForeignKey, UniqueConstraint, Index, text, Text
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.database import Base
@@ -25,6 +25,10 @@ class User(Base):
     records = relationship("Record", back_populates="user")
     bmi_histories = relationship("BMIHistory", back_populates="user")
     inbody_records = relationship("InBodyRecord", back_populates="user")
+
+    daily_activities = relationship("DailyActivity", back_populates="user")
+    food_analysis_results = relationship("FoodAnalysisResult", back_populates="user")
+    diet_plans = relationship("UserDietPlan", back_populates="user")
     
     def __repr__(self):
         return f"<User(user_number={self.user_number}, username='{self.username}')>"
@@ -43,6 +47,7 @@ class UserProfile(Base):
     birth_date = Column(DateTime(timezone=True), nullable=True)  # 생년월일
     gender = Column(String(10), nullable=True)  # 성별
     goal_type = Column(String(20), nullable=True)  # diet/bulk/maintain 등
+    activity_level = Column(String(20), nullable=True)  # sedentary/light/moderate/active
     body_fat_percent = Column(Float, nullable=True)  # 체지방률
     skeletal_muscle_mass = Column(Float, nullable=True)  # 골격근량
     bmr = Column(Float, nullable=True)  # 기초대사량
@@ -65,7 +70,7 @@ class UserGoal(Base):
     user_number = Column(Integer, ForeignKey("users.user_number"), nullable=False)
 
     goal_type = Column(String(20), nullable=False)  # diet/maintain/bulk
-    target_calory = Column(Float, nullable=True)
+    target_calorie = Column(Float, nullable=True)
     target_protein = Column(Float, nullable=True)
     target_carb = Column(Float, nullable=True)
     target_fat = Column(Float, nullable=True)
@@ -90,9 +95,9 @@ class Food(Base):
     user_number = Column(Integer, ForeignKey("users.user_number"), nullable=True)
     food_name = Column(String(100), nullable=False)
     food_calories = Column(Float, nullable=False)
-    food_proteins = Column(Float, nullable=False)
-    food_carbs = Column(Float, nullable=False)
-    food_fats = Column(Float, nullable=False)
+    food_protein = Column(Float, nullable=False)
+    food_carb = Column(Float, nullable=False)
+    food_fat = Column(Float, nullable=False)
     food_image = Column(String, nullable=True)
     
     # 관계 설정
@@ -105,7 +110,7 @@ class Food(Base):
 
 class Record(Base):
     """식단 기록 테이블 - 기록 당시의 영양 정보를 스냅샷으로 저장"""
-    __tablename__ = "records"
+    __tablename__ = "record"
     
     record_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     user_number = Column(Integer, ForeignKey("users.user_number"), nullable=False)
@@ -117,8 +122,8 @@ class Record(Base):
     food_name = Column(String(100), nullable=False)
     food_calories = Column(Float, nullable=False)
     food_protein = Column(Float, nullable=False)
-    food_carbs = Column(Float, nullable=False)
-    food_fats = Column(Float, nullable=False)
+    food_carb = Column(Float, nullable=False)
+    food_fat = Column(Float, nullable=False)
     serving_size = Column(Float, nullable=True)  # 1회 제공량 (예: 100)
     serving_unit = Column(String(20), nullable=True)  # 제공량 단위 (g, ml, 개 등)
     quantity = Column(Float, nullable=True)  # 섭취량 (예: 1.5)
@@ -136,6 +141,53 @@ class Record(Base):
     def __repr__(self):
         return f"<Record(record_id={self.record_id}, food_name='{self.food_name}', food_calories={self.food_calories})>"
 
+class FoodAnalysisResult(Base):
+    """음식 분석 결과 임시 저장 테이블"""
+    __tablename__ = "food_analysis_results"
+
+    far_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    user_number = Column(Integer, ForeignKey("users.user_number"), nullable=False)
+
+    image_url = Column(String, nullable=False)
+
+    predicted_food_name = Column(String(100), nullable=False)
+    predicted_reason = Column(Text, nullable=True)
+
+    estimated_serving_g = Column(Float, nullable=True)
+    estimated_calories_kcal = Column(Float, nullable=True)
+    estimated_carb_g = Column(Float, nullable=True)
+    estimated_protein_g = Column(Float, nullable=True)
+    estimated_fat_g = Column(Float, nullable=True)
+
+    model = Column(String(50), nullable=False, server_default="gpt-4.1-mini")
+    status = Column(String(20), nullable=False, server_default="PENDING")
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # 관계 설정 (원하면 User에도 back_populates 추가)
+    user = relationship("User", back_populates="food_analysis_results")
+
+    def __repr__(self):
+        return f"<FoodAnalysisResult(far_id={self.far_id}, user_number={self.user_number}, predicted_food_name='{self.predicted_food_name}')>"
+
+
+class UserDietPlan(Base):
+    """사용자 목표 식단 저장 테이블"""
+    __tablename__ = "user_diet_plans"
+
+    plan_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    user_number = Column(Integer, ForeignKey("users.user_number"), nullable=False)
+
+    goal_type = Column(String(20), nullable=False)  # diet/maintain/bulk
+    target_calorie = Column(Float, nullable=True)
+    plan_json = Column(Text, nullable=False)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", back_populates="diet_plans")
+
+    def __repr__(self):
+        return f"<UserDietPlan(plan_id={self.plan_id}, user_number={self.user_number}, goal_type={self.goal_type})>"
 
 class BMIHistory(Base):
     """BMI 히스토리 테이블 모델"""
@@ -170,8 +222,8 @@ class InBodyRecord(Base):
     bmr = Column(Float, nullable=True)                 # 기초대사량 (kcal)
     abdominal_fat_ratio = Column(Float, nullable=True)   # 복부지방률
     inbody_score = Column(Integer, nullable=True)      # 인바디점수
-    predicted_cluster = Column(Integer, nullable=True)  # 체형 클러스터 ID (선택)
-    cluster_name = Column(String(50), nullable=True)    # 체형 클러스터 이름 (선택)
+    predicted_classify = Column(Integer, nullable=True)  # 체형 분류 ID (선택)
+    classify_name = Column(String(50), nullable=True)    # 체형 분류 이름 (선택)
     source = Column(String(20), nullable=True)          # 입력 방식 (manual/ocr/csv)
     note = Column(String(255), nullable=True)           # 사용자 메모
 
@@ -184,4 +236,55 @@ class InBodyRecord(Base):
         return (
             f"<InBodyRecord(inbody_id={self.inbody_id}, user_number={self.user_number}, "
             f"measurement_date={self.measurement_date}, source={self.source})>"
+        )
+
+class DailyActivity(Base):
+    """일일 활동 기록 테이블"""
+    __tablename__ = "daily_activities"
+
+    activity_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    user_number = Column(Integer, ForeignKey("users.user_number"), nullable=False)
+
+    # 활동 정보
+    activity_date = Column(Date, nullable=False)  # 활동 날짜
+    activity_type = Column(String(50), nullable=False)  # 활동 종류 (예: 걷기, 자전거)
+    steps = Column(Integer, nullable=True)  # 걸음 수 (해당 활동에 해당하는 경우)
+    active_kcal = Column(Float, nullable=True)  # 활동 대사량
+    total_kcal = Column(Float, nullable=True)  # 총 대사량
+    workout_minutes = Column(Integer, nullable=True)  # 운동 시간
+    distance_meters = Column(Float, nullable=True)  # 이동 거리 (미터 단위)
+    
+    activity_source = Column(String(20), nullable=True)  # 데이터 출처 (예: 'health_connect' | 'healthkit' | 'manual')
+    activity_source_device = Column(String(100), nullable=True)  # 데이터 출처 디바이스 정보
+    activity_source_app = Column(String(100), nullable=True)  # 데이터 출처 앱 정보
+    activity_source_record_id = Column(String(100), nullable=True)  # 원천 데이터 레코드 ID
+    
+    activity_synced_at = Column(DateTime(timezone=True), nullable=True)  # 데이터 동기화 시각
+    activity_created_at = Column(DateTime(timezone=True), server_default=func.now())  # 활동 데이터 생성 시각
+    activity_updated_at = Column(DateTime(timezone=True), onupdate=func.now())  # 활동 데이터 수정 시각
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_number",
+            "activity_source",
+            "activity_source_record_id",
+            name="uq_daily_activity_source_record",
+        ),
+        Index(
+            "uq_daily_activity_user_date_type_null_source",
+            "user_number",
+            "activity_date",
+            "activity_type",
+            unique=True,
+            postgresql_where=text("activity_source_record_id IS NULL"),
+        ),
+    )
+
+    # 관계 설정
+    user = relationship("User", back_populates="daily_activities")
+
+    def __repr__(self):
+        return (
+            f"<DailyActivity(activity_id={self.activity_id}, user_number={self.user_number}, "
+            f"activity_date={self.activity_date}, activity_type='{self.activity_type}')>"
         )
