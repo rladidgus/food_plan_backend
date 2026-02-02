@@ -1,25 +1,23 @@
-version: '3.8'
+version: "3.8"
 
 services:
-  # PostgreSQL 데이터베이스
   db:
     image: postgres:15
     container_name: diet-db
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: password
-      POSTGRES_DB: postgres  # 기존 DB 이름 유지
+      POSTGRES_DB: postgres
     ports:
       - "5432:5432"
     volumes:
-      - ./postgres_data:/var/lib/postgresql/data  # 기존 로컬 볼륨 사용
+      - ./postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 10s
       timeout: 5s
       retries: 5
 
-  # FastAPI 백엔드
   app:
     build: .
     container_name: diet-app
@@ -28,14 +26,12 @@ services:
         condition: service_healthy
     environment:
       DB_HOST: db
-      DB_NAME: postgres  # 기존 DB 이름
+      DB_NAME: postgres
       DB_USER: postgres
       DB_PASS: password
       DB_PORT: 5432
     ports:
-      - "8000:8000"  # API 포트 개방
+      - "8000:8000"
     volumes:
-      - .:/app  # 개발 중 코드 변경 반영
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-    stdin_open: true
-    tty: true
+      - ./uploads:/app/uploads
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
