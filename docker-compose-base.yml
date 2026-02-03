@@ -20,7 +20,7 @@ services:
 
   app:
     env_file:
-      - .env.local
+      - .env
     build: .
     container_name: diet-app
     depends_on:
