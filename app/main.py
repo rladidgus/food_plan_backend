@@ -1,4 +1,5 @@
 import os
+import json
 import traceback
 import time
 import logging
@@ -22,10 +23,12 @@ from app.models import Record, InBodyRecord, User, UserProfile, FoodAnalysisResu
 from typing import List, Optional
 from app import models
 from app.inbody_ocr import extract_key_values, format_key_values, upstage_ocr_from_bytes, update_user_inbody
-from app.models import Record, InBodyRecord, User, UserProfile, UserGoal, DailyActivity
-from app.goal_rules import estimate_target_calorie, normalize_activity_level, ACTIVITY_FACTORS
+from app.models import Record, InBodyRecord, User, UserProfile, UserGoal, DailyActivity, UserDietPlan
+from app.goal_rules import estimate_target_calorie, normalize_activity_level, ACTIVITY_FACTORS, infer_goal_type
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from supabase import create_client, Client
+from openai import OpenAI
+import requests
 
 # Supabase 클라이언트 초기화
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -39,6 +42,16 @@ security = HTTPBearer()
 
 UPLOAD_DIR = Path("uploads/foods")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY 환경변수가 필요합니다.")
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+# PEXELS_API_KEY 환경변수에 발급받은 키를 설정하세요.
+PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
+PEXELS_API_URL = "https://api.pexels.com/v1/search"
+_pexels_cache: dict[str, Optional[str]] = {}
 
 # 환경 변수에서 DB 정보 가져오기
 DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -149,6 +162,75 @@ class UserGoalUpdateRequest(BaseModel):
     user_number: int
     goal_type: str
     target_calorie: Optional[float] = None
+
+
+class DietPlan3DaysRequest(BaseModel):
+    """3일 식단 추천 요청"""
+    user_number: Optional[int] = None
+    id: Optional[str] = None
+    goal_type: Optional[str] = None
+    target_calorie: Optional[float] = None
+
+
+class MealPlanItem(BaseModel):
+    name: str
+    description: Optional[str] = None
+    calories_kcal: int
+    carbs_g: float
+    protein_g: float
+    fat_g: float
+    image_url: Optional[str] = None
+
+
+class DayMealPlan(BaseModel):
+    day_label: str
+    date: Optional[str] = None
+    breakfast: MealPlanItem
+    lunch: MealPlanItem
+    dinner: MealPlanItem
+    total_calories_kcal: int
+    total_carbs_g: float
+    total_protein_g: float
+    total_fat_g: float
+
+
+class OneDayMealPlan(BaseModel):
+    goal_type: str
+    target_calorie: Optional[int] = None
+    body_type_stage1: Optional[str] = None
+    body_type_stage2: Optional[str] = None
+    notes: List[str]
+    days: List[DayMealPlan]
+
+
+class PlanMealRecordIn(BaseModel):
+    meal_type: str
+    name: str
+    calories_kcal: float
+    carbs_g: float
+    protein_g: float
+    fat_g: float
+
+
+class PlanRecordCreateRequest(BaseModel):
+    user_number: Optional[int] = None
+    id: Optional[str] = None
+    record_date: Optional[str] = None  # YYYY-MM-DD, default: today
+    meals: List[PlanMealRecordIn]
+
+
+class PlanRecordCreateResult(BaseModel):
+    record_ids: List[int]
+
+
+class TodayIntakeResponse(BaseModel):
+    goal_type: str
+    target_calorie: Optional[float] = None
+    total_calories_kcal: int
+    total_carbs_g: float
+    total_protein_g: float
+    total_fat_g: float
+    plan_date: Optional[str] = None
 
 
 
@@ -317,6 +399,61 @@ def _resolve_user_from_session_or_params(
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="로그인이 필요합니다.")
     return user
+
+
+def _normalize_goal_type(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    raw = str(value).strip().lower()
+    goal_type_map = {
+        "diet": "diet",
+        "다이어트": "diet",
+        "감량": "diet",
+        "maintain": "maintain",
+        "유지": "maintain",
+        "표준": "maintain",
+        "bulk": "bulk",
+        "벌크": "bulk",
+        "벌크업": "bulk",
+        "증량": "bulk",
+    }
+    return goal_type_map.get(raw, raw)
+
+
+def _fetch_pexels_image(query: str) -> Optional[str]:
+    if not query:
+        return None
+    if not PEXELS_API_KEY:
+        return None
+    key = query.strip().lower()
+    if key in _pexels_cache:
+        return _pexels_cache[key]
+
+    try:
+        resp = requests.get(
+            PEXELS_API_URL,
+            headers={"Authorization": PEXELS_API_KEY},
+            params={
+                "query": query,
+                "per_page": 1,
+                "orientation": "landscape",
+            },
+            timeout=5,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        photos = data.get("photos") or []
+        if not photos:
+            _pexels_cache[key] = None
+            return None
+
+        src = photos[0].get("src") or {}
+        image_url = src.get("large") or src.get("medium") or src.get("original")
+        _pexels_cache[key] = image_url
+        return image_url
+    except Exception:
+        _pexels_cache[key] = None
+        return None
 
 @app.post("/api/register", response_model=AuthResponse)
 def register(user_data: UserCreate, db: Session = Depends(get_db)):
@@ -649,20 +786,7 @@ def get_user_goal(request: Request, user_number: int = 1, db: Session = Depends(
 @app.post("/api/user/goal", response_model=UserGoalResponse)
 def upsert_user_goal(payload: UserGoalUpdateRequest, db: Session = Depends(get_db)):
     """사용자 목표 변경(없으면 생성)"""
-    raw_goal_type = payload.goal_type.strip().lower()
-    goal_type_map = {
-        "diet": "diet",
-        "다이어트": "diet",
-        "감량": "diet",
-        "maintain": "maintain",
-        "유지": "maintain",
-        "표준": "maintain",
-        "bulk": "bulk",
-        "벌크": "bulk",
-        "벌크업": "bulk",
-        "증량": "bulk",
-    }
-    goal_type = goal_type_map.get(raw_goal_type, raw_goal_type)
+    goal_type = _normalize_goal_type(payload.goal_type)
     if goal_type not in {"diet", "maintain", "bulk"}:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -728,6 +852,260 @@ def upsert_user_goal(payload: UserGoalUpdateRequest, db: Session = Depends(get_d
         "start_date": goal.start_date.isoformat() if goal.start_date else None,
         "end_date": goal.end_date.isoformat() if goal.end_date else None,
         "created_at": goal.created_at.isoformat() if goal.created_at else None,
+    }
+
+
+@app.post("/api/diet-plan", response_model=OneDayMealPlan)
+def generate_1day_diet_plan(
+    payload: DietPlan3DaysRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """인바디 기반 1일 식단 추천 (OpenAI)"""
+    user = _resolve_user_from_session_or_params(request, db, payload.id, payload.user_number)
+
+    profile = (
+        db.query(UserProfile)
+        .filter(UserProfile.user_number == user.user_number)
+        .first()
+    )
+    latest_inbody = (
+        db.query(InBodyRecord)
+        .filter(InBodyRecord.user_number == user.user_number)
+        .order_by(InBodyRecord.created_at.desc())
+        .first()
+    )
+    if not latest_inbody:
+        raise HTTPException(status_code=404, detail="인바디 기록이 없습니다.")
+
+    body_stage1 = None
+    body_stage2 = None
+    gender_raw = (profile.gender if profile else None)
+    gender = None
+    if gender_raw:
+        value = str(gender_raw).strip().lower()
+        if value in ("m", "male", "남", "남성"):
+            gender = "M"
+        elif value in ("f", "female", "여", "여성"):
+            gender = "F"
+
+    required_fields = {
+        "height": latest_inbody.height,
+        "weight": latest_inbody.weight,
+        "body_fat_mass": latest_inbody.body_fat_mass,
+        "body_fat_pct": latest_inbody.body_fat_pct,
+        "skeletal_muscle_mass": latest_inbody.skeletal_muscle_mass,
+    }
+    if gender and all(value is not None for value in required_fields.values()):
+        inbody_input = InbodyInput(
+            gender=gender,
+            height_cm=latest_inbody.height,
+            weight_kg=latest_inbody.weight,
+            body_fat_kg=latest_inbody.body_fat_mass,
+            body_fat_pct=latest_inbody.body_fat_pct,
+            skeletal_muscle_kg=latest_inbody.skeletal_muscle_mass,
+            bmr_kcal=latest_inbody.bmr,
+        )
+        body_result = classify_body_type(inbody_input)
+        body_stage1 = body_result.stage1
+        body_stage2 = body_result.stage2
+
+    goal_type = _normalize_goal_type(payload.goal_type)
+    if goal_type and goal_type not in {"diet", "maintain", "bulk"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="goal_type은 diet/maintain/bulk 중 하나여야 합니다.",
+        )
+
+    latest_goal = (
+        db.query(UserGoal)
+        .filter(UserGoal.user_number == user.user_number)
+        .order_by(UserGoal.created_at.desc())
+        .first()
+    )
+    if goal_type is None:
+        if body_stage1 or body_stage2:
+            goal_type = infer_goal_type(body_stage1 or "", body_stage2 or "")
+        elif latest_goal and latest_goal.goal_type:
+            goal_type = _normalize_goal_type(latest_goal.goal_type)
+        elif profile and profile.goal_type:
+            goal_type = _normalize_goal_type(profile.goal_type)
+        else:
+            goal_type = "maintain"
+
+    target_calorie = payload.target_calorie
+    if target_calorie is None:
+        if latest_goal and latest_goal.target_calorie is not None:
+            target_calorie = latest_goal.target_calorie
+        else:
+            target_calorie = estimate_target_calorie(
+                goal_type,
+                latest_inbody.bmr,
+                latest_inbody.weight,
+                normalize_activity_level(profile.activity_level) if profile else None,
+            )
+
+    prompt = {
+        "goal_type": goal_type,
+        "target_calorie": round(float(target_calorie)) if target_calorie else None,
+        "body_type_stage1": body_stage1,
+        "body_type_stage2": body_stage2,
+        "latest_inbody": {
+            "height_cm": latest_inbody.height,
+            "weight_kg": latest_inbody.weight,
+            "body_fat_pct": latest_inbody.body_fat_pct,
+            "skeletal_muscle_kg": latest_inbody.skeletal_muscle_mass,
+            "bmr_kcal": latest_inbody.bmr,
+        },
+        "activity_level": normalize_activity_level(profile.activity_level) if profile else None,
+        "notes": [
+            "한국어로만 작성한다.",
+            "1일치(1일) 식단을 제공한다.",
+            "각 일자는 아침/점심/저녁으로 구성한다.",
+            "일일 총칼로리는 목표 칼로리 ±5% 범위를 지향한다.",
+            "식단 이름은 한국어로 자연스럽고 구체적으로 작성한다.",
+            "영양값은 추정치이며 현실적인 범위로 작성한다.",
+        ],
+    }
+
+    resp = openai_client.responses.parse(
+        model="gpt-4.1-mini",
+        temperature=0.2,
+        input=[
+            {
+                "role": "system",
+                "content": (
+                    "너는 한국어로만 답하는 식단 코치다. "
+                    "반드시 지정된 JSON 스키마만 출력한다."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "다음 정보를 바탕으로 1일치 식단을 추천해줘. "
+                    "지정된 JSON 스키마만 출력해.\n"
+                    f"{json.dumps(prompt, ensure_ascii=False)}"
+                ),
+            },
+        ],
+        text_format=OneDayMealPlan,
+    )
+
+    plan: OneDayMealPlan = resp.output_parsed
+    if not plan or len(plan.days) != 1:
+        raise HTTPException(status_code=500, detail="식단 생성 결과가 올바르지 않습니다.")
+
+    # 음식 이미지 URL 붙이기 (Pexels)
+    for day in plan.days:
+        for meal in (day.breakfast, day.lunch, day.dinner):
+            if not meal.image_url:
+                meal.image_url = _fetch_pexels_image(meal.name)
+
+    record = UserDietPlan(
+        user_number=user.user_number,
+        goal_type=goal_type,
+        target_calorie=target_calorie,
+        plan_json=json.dumps(plan.model_dump(), ensure_ascii=False),
+    )
+    db.add(record)
+    db.commit()
+
+    return plan
+
+
+@app.post("/api/plan/record", response_model=PlanRecordCreateResult)
+def create_records_from_plan(
+    payload: PlanRecordCreateRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """체크된 식단 항목을 오늘 기록으로 저장"""
+    user = _resolve_user_from_session_or_params(request, db, payload.id, payload.user_number)
+
+    if not payload.meals:
+        raise HTTPException(status_code=400, detail="meals가 비어 있습니다.")
+
+    record_day = datetime.now().date()
+    if payload.record_date:
+        try:
+            record_day = datetime.strptime(payload.record_date, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="record_date는 YYYY-MM-DD 형식이어야 합니다.")
+
+    allowed_meal_types = {"breakfast", "lunch", "dinner", "snack", "아침", "점심", "저녁", "간식"}
+    meal_type_alias = {
+        "아침": "breakfast",
+        "점심": "lunch",
+        "저녁": "dinner",
+        "간식": "snack",
+    }
+
+    record_ids: List[int] = []
+    for meal in payload.meals:
+        if not meal.meal_type:
+            raise HTTPException(status_code=400, detail="meal_type은 비어 있을 수 없습니다.")
+        raw_type = meal.meal_type.strip().lower()
+        if raw_type not in allowed_meal_types:
+            raise HTTPException(status_code=400, detail="meal_type은 아침/점심/저녁/간식 중 하나여야 합니다.")
+        meal_type = meal_type_alias.get(raw_type, raw_type)
+
+        if not meal.name or not meal.name.strip():
+            raise HTTPException(status_code=400, detail="name은 비어 있을 수 없습니다.")
+
+        rec = Record(
+            user_number=user.user_number,
+            food_name=meal.name.strip(),
+            food_calories=float(meal.calories_kcal),
+            food_protein=float(meal.protein_g),
+            food_carb=float(meal.carbs_g),
+            food_fat=float(meal.fat_g),
+            meal_type=meal_type,
+            record_created_at=datetime.combine(record_day, dt_time(12, 0, 0)),
+        )
+        db.add(rec)
+        db.flush()
+        record_ids.append(rec.record_id)
+
+    db.commit()
+    return {"record_ids": record_ids}
+
+
+@app.get("/api/intake/today", response_model=TodayIntakeResponse)
+def get_today_intake_from_plan(
+    request: Request,
+    id: Optional[str] = None,
+    user_number: Optional[int] = None,
+    db: Session = Depends(get_db),
+):
+    """최신 1일 식단 계획에서 총 영양정보 반환"""
+    user = _resolve_user_from_session_or_params(request, db, id, user_number)
+
+    plan_record = (
+        db.query(UserDietPlan)
+        .filter(UserDietPlan.user_number == user.user_number)
+        .order_by(UserDietPlan.created_at.desc())
+        .first()
+    )
+    if not plan_record:
+        raise HTTPException(status_code=404, detail="식단 계획이 없습니다.")
+
+    try:
+        plan = json.loads(plan_record.plan_json)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="식단 계획 데이터가 손상되었습니다.")
+
+    days = plan.get("days") or []
+    if not days:
+        raise HTTPException(status_code=500, detail="식단 계획에 day 데이터가 없습니다.")
+
+    day0 = days[0]
+    goal_type = plan.get("goal_type") or plan_record.goal_type or "maintain"
+    return {
+        "goal_type": goal_type,
+        "total_calories_kcal": int(day0.get("total_calories_kcal") or 0),
+        "total_carbs_g": float(day0.get("total_carbs_g") or 0),
+        "total_protein_g": float(day0.get("total_protein_g") or 0),
+        "total_fat_g": float(day0.get("total_fat_g") or 0),
     }
 
 
