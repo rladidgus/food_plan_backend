@@ -4,10 +4,9 @@ import traceback
 import time
 import logging
 import time as time_module
-from datetime import date, datetime, timezone, time as dt_time, timedelta as dt_timedelta
+from datetime import date, datetime, timezone, time, timedelta
 from pathlib import Path
 from uuid import uuid4
-from datetime import datetime, timedelta
 from sqlalchemy import and_
 from fastapi.responses import RedirectResponse
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, status, Request
@@ -570,6 +569,203 @@ async def get_current_user_from_token(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="인증에 실패했습니다."
         )
+# --- Social Login & Registration ---
+
+class SocialCheckRequest(BaseModel):
+    access_token: str
+
+class SocialRegisterRequest(BaseModel):
+    access_token: str
+    username: str
+    height: Optional[float] = None
+    weight: Optional[float] = None
+    gender: Optional[str] = None
+    age: Optional[int] = None
+    activity_level: Optional[str] = None
+    goal_type: Optional[str] = "maintain"
+
+@app.get("/api/auth/oauth/url")
+def get_oauth_url(provider: str = "google"):
+    """
+    Supabase OAuth 로그인 URL 생성 후 바로 리다이렉트
+    (공식 supabase-py 패턴: sign_in_with_oauth 사용)
+    """
+    try:
+        redirect_to = "http://localhost:3000/login/callback"  # 프론트에서 쓰는 콜백으로 맞추기
+
+        resp = supabase.auth.sign_in_with_oauth({
+            "provider": provider,
+            "options": {
+                "redirect_to": redirect_to
+            }
+        })
+
+        # ✅ 브라우저가 이 엔드포인트로 오면 구글 로그인 페이지로 바로 이동
+        return RedirectResponse(url=resp.url, status_code=302)
+
+    except Exception as e:
+        print(f"OAuth URL generation error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"OAuth URL 생성 중 오류가 발생했습니다: {str(e)}"
+        )
+
+@app.post("/api/auth/social-check")
+def check_social_user(payload: SocialCheckRequest, db: Session = Depends(get_db)):
+    """
+    소셜 로그인 후 가입 여부 확인
+    - 가입되어 있으면: 로그인 처리 결과 반환
+    - 가입 안되어 있으면: 자동 가입 후 반환 (현재 코드 정책)
+    """
+    try:
+        # 1. 토큰 검증
+        user_response = supabase.auth.get_user(payload.access_token)
+        user_data = user_response.user
+
+        if not user_data:
+            raise HTTPException(status_code=401, detail="Invalid token")
+
+    except Exception as e:
+        print(f"Social check failed: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # 2. DB 조회
+    existing_user = db.query(User).filter(User.provider_user_id == user_data.id).first()
+    
+    if existing_user:
+        return {
+            "registered": True,
+            "user_number": existing_user.user_number,
+            "id": existing_user.id,
+            "username": existing_user.username,
+            "message": "로그인 성공"
+        }
+    
+    # 3. 없으면 자동 가입 (사용자 요청 반영: 소셜 로그인 시 무조건 DB 저장)
+    # ID는 이메일이나 난수로 생성, 비밀번호는 사용 안 함(Dummy)
+    provider_user_id = user_data.id
+    email = user_data.email
+    if not email:
+        raise HTTPException(status_code=400, detail="이메일 정보를 가져올 수 없습니다.")
+
+    new_username = (
+        user_data.user_metadata.get("full_name") 
+        or user_data.user_metadata.get("name") 
+        or email.split("@")[0]
+    )
+
+    new_user = User(
+        id=email, 
+        username=new_username,
+        password=uuid4().hex, # 비밀번호 미사용
+        provider_user_id=provider_user_id,
+        email=email,
+        role="user"
+    )
+    db.add(new_user)
+    db.flush() # user_number 생성을 위해 필수
+
+    # 기본 프로필 생성
+    new_profile = UserProfile(
+        user_number=new_user.user_number,
+        goal_type="maintain", # 기본값
+        activity_level="sedentary" # 기본값
+    )
+    db.add(new_profile)
+
+    # 기본 목표 생성
+    goal = UserGoal(
+        user_number=new_user.user_number,
+        id=new_user.id,
+        goal_type="maintain",
+        start_date=datetime.now(timezone.utc),
+    )
+    db.add(goal)
+
+    db.commit()
+    db.refresh(new_user)
+
+    return {
+        "registered": True,
+        "user_number": new_user.user_number,
+        "id": new_user.id,
+        "username": new_user.username,
+        "message": "회원가입 및 로그인 성공"
+    }
+
+
+@app.post("/api/auth/social-register")
+def register_social_user(payload: SocialRegisterRequest, db: Session = Depends(get_db)):
+    """
+    소셜 로그인 후 추가 정보를 입력받아 회원가입 완료
+    """
+    try:
+        # 1) 토큰 검증 (supabase-py 공식 사용 패턴 유지)
+        user_response = supabase.auth.get_user(payload.access_token)
+        user_data = user_response.user
+        if not user_data:
+            raise HTTPException(status_code=401, detail="Invalid token")
+
+        provider_user_id = user_data.id
+        email = user_data.email
+
+        if not email:
+            raise HTTPException(status_code=400, detail="이메일 정보를 가져올 수 없습니다.")
+
+        # 2) 중복 확인
+        exists = db.query(User).filter(User.provider_user_id == provider_user_id).first()
+        if exists:
+            raise HTTPException(status_code=400, detail="이미 가입된 사용자입니다.")
+
+        # 3) User 생성
+        new_user = User(
+            id=email,  # 로컬 로그인 id 컬럼을 이메일로 사용
+            username=payload.username,
+            password=uuid4().hex,  # 소셜은 비밀번호 미사용이므로 더미
+            provider_user_id=provider_user_id,
+            email=email,
+            role="user",
+        )
+        db.add(new_user)
+        db.flush()  # ✅ user_number(PK) 생성되도록 (commit 전에 PK 필요)
+
+        # 4) Profile 생성
+        new_profile = UserProfile(
+            user_number=new_user.user_number,
+            height=payload.height,
+            weight=payload.weight,
+            age=payload.age,
+            gender=payload.gender,
+            activity_level=normalize_activity_level(payload.activity_level) if payload.activity_level else "sedentary",
+            goal_type=payload.goal_type,
+        )
+        db.add(new_profile)
+
+        # 5) Goal 생성(기본값)
+        if payload.goal_type:
+            goal = UserGoal(
+                user_number=new_user.user_number,
+                id=new_user.id,
+                goal_type=payload.goal_type,
+                start_date=datetime.now(timezone.utc),
+            )
+            db.add(goal)
+
+        # 6) 마지막에 한 번만 커밋 (표준적인 트랜잭션 패턴)
+        db.commit()
+        db.refresh(new_user)
+
+        return {
+            "registered": True,
+            "user_number": new_user.user_number,
+            "id": new_user.id,
+            "username": new_user.username,
+            "message": "회원가입 완료",
+        }
+
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
 
 # --- Social Login & Registration ---
 
@@ -1570,7 +1766,7 @@ def get_record(date: str, user_number: int = 3, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="date는 YYYY-MM-DD 형식이어야 합니다.")
 
     start = day
-    end = day + dt_timedelta(days=1)
+    end = day + timedelta(days=1)
 
     rows = db.query(Record).filter(
         Record.user_number == user_number,
@@ -1663,7 +1859,7 @@ async def vision_food(
                 day = datetime.strptime(record_date, "%Y-%m-%d").date()
             except ValueError:
                 raise HTTPException(status_code=400, detail="record_date는 YYYY-MM-DD 형식이어야 합니다.")
-            record_created_at = datetime.combine(day, dt_time(12, 0, 0))
+            record_created_at = datetime.combine(day, time(12, 0, 0))
 
         rec = Record(
             user_number=user_number,
