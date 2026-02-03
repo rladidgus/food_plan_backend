@@ -28,3 +28,6 @@ postgres_data/
 
 # 문서
 README.md
+
+# 업로드 파일
+uploads/

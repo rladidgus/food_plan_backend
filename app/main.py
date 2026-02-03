@@ -9,10 +9,9 @@ from pathlib import Path
 from uuid import uuid4
 from sqlalchemy import and_
 from fastapi.responses import RedirectResponse
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, status, Request
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from app.food_lens import decide_food_gpt_only
@@ -72,7 +71,6 @@ FRONTEND_ORIGINS = [
     ).split(",")
     if origin.strip()
 ]
-SESSION_SECRET = os.getenv("SESSION_SECRET", "dev-secret")
 
 # CORS 설정 (Next.js 프론트엔드와 통신)
 app.add_middleware(
@@ -83,13 +81,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 세션 기반 로그인 (쿠키)
-app.add_middleware(
-    SessionMiddleware,
-    secret_key=SESSION_SECRET,
-    same_site="lax",
-    https_only=False,
-)
 
 # Pydantic 모델 (요청/응답 스키마)
 class DietRecordRequest(BaseModel):
@@ -112,6 +103,13 @@ class UserResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class AuthResponse(BaseModel):
+    user_number: int
+    id: str
+    username: str
+    message: str
 
 
 class UserGoalResponse(BaseModel):
@@ -158,7 +156,7 @@ class MyPageEnvelopeResponse(BaseModel):
 
 class UserGoalUpdateRequest(BaseModel):
     """사용자 목표 변경 요청"""
-    user_number: int
+    user_number: Optional[int] = None
     goal_type: str
     target_calorie: Optional[float] = None
 
@@ -234,7 +232,7 @@ class TodayIntakeResponse(BaseModel):
 
 
 class ActivityLevelUpdateRequest(BaseModel):
-    user_number: int
+    user_number: Optional[int] = None
     activity_level: str
 
 
@@ -266,7 +264,7 @@ class InBodyOcrResponse(BaseModel):
 
 
 class DailyActivityIn(BaseModel):
-    user_number: int
+    user_number: Optional[int] = None
     activity_date: date
     activity_type: str
     steps: Optional[int] = None
@@ -326,7 +324,7 @@ def _normalize_activity(item: DailyActivityIn) -> DailyActivityIn:
 
 
 class BodyTypeFromUserRequest(BaseModel):
-    user_number: int
+    user_number: Optional[int] = None
 
 
 
@@ -349,22 +347,6 @@ def root():
     }
 
 
-class UserCreate(BaseModel):
-    id: str
-    username: str
-    password: str
-
-class UserLogin(BaseModel):
-    id: str
-    password: str
-
-class AuthResponse(BaseModel):
-    user_number: int
-    id: str
-    username: str
-    message: str
-
-
 class LogoutResponse(BaseModel):
     message: str
 
@@ -373,31 +355,6 @@ class RecordDeleteResponse(BaseModel):
     """식단 기록 삭제 응답"""
     record_id: int
     message: str
-
-
-def _resolve_user_from_session_or_params(
-    request: Request,
-    db: Session,
-    id: Optional[str],
-    user_number: Optional[int],
-) -> User:
-    session_user_id = request.session.get("user_id")
-    if session_user_id:
-        user = db.query(User).filter(User.id == session_user_id).first()
-        if not user:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="세션이 유효하지 않습니다.")
-        return user
-
-    if id:
-        user = db.query(User).filter(User.id == id).first()
-    elif user_number is not None:
-        user = db.query(User).filter(User.user_number == user_number).first()
-    else:
-        user = None
-
-    if not user:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="로그인이 필요합니다.")
-    return user
 
 
 def _normalize_goal_type(value: Optional[str]) -> Optional[str]:
@@ -454,62 +411,6 @@ def _fetch_pexels_image(query: str) -> Optional[str]:
         _pexels_cache[key] = None
         return None
 
-@app.post("/api/register", response_model=AuthResponse)
-def register(user_data: UserCreate, db: Session = Depends(get_db)):
-    """회원가입"""
-    # 아이디 중복 확인
-    existing_user = db.query(User).filter(User.id == user_data.id).first()
-    if existing_user:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="이미 존재하는 아이디입니다."
-        )
-    
-    new_user = User(
-        id=user_data.id,
-        username=user_data.username,
-        password=user_data.password
-        # 나머지 필드(height, weight 등)는 nullable=True이므로 생략 가능
-    )
-    db.add(new_user)
-    db.commit()
-    db.refresh(new_user)
-    
-    return {
-        "user_number": new_user.user_number,
-        "id": new_user.id,
-        "username": new_user.username,
-        "message": "회원가입이 완료되었습니다."
-    }
-
-@app.post("/api/login", response_model=AuthResponse)
-def login(user_data: UserLogin, request: Request, db: Session = Depends(get_db)):
-    """로그인"""
-    # 로그인 아이디(id)로 사용자 검색
-    user = db.query(User).filter(User.id == user_data.id).first()
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="아이디 또는 비밀번호가 올바르지 않습니다."
-        )
-    
-    # 비밀번호 검증 (평문 비교)
-    if user_data.password != user.password:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="아이디 또는 비밀번호가 올바르지 않습니다."
-        )
-
-    request.session["user_id"] = user.id
-    request.session["user_number"] = user.user_number
-
-    return {
-        "user_number": user.user_number,
-        "id": user.id,
-        "username": user.username,
-        "message": "로그인 성공"
-    }
-
 async def get_current_user_from_token(
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: Session = Depends(get_db)
@@ -540,10 +441,10 @@ async def get_current_user_from_token(
             
         # 3. 없으면 자동 회원가입 진행
         # ID는 이메일이나 난수로 생성, 비밀번호는 사용 안 함(Dummy)
-        new_username = user_data.user_metadata.get("full_name") or user_data.user_metadata.get("name") or email.split("@")[0]
+        new_username = user_data.user_metadata.get("full_name") or user_data.user_metadata.get("name") or (email.split("@")[0] if email else provider_user_id[:8])
         
         new_user = User(
-            id=email, # 소셜 로그인은 이메일을 ID로 사용하거나 UUID 사용
+            id=_fallback_user_id(provider_user_id, email),
             username=new_username,
             password=uuid4().hex, # 비밀번호는 랜덤으로 설정 (로그인에 사용 안 함)
             provider_user_id=provider_user_id,
@@ -574,6 +475,16 @@ async def get_current_user_from_token(
 class SocialCheckRequest(BaseModel):
     access_token: str
 
+class SocialCheckResponse(BaseModel):
+    registered: bool
+    user_number: Optional[int] = None
+    id: Optional[str] = None
+    username: Optional[str] = None
+    message: Optional[str] = None
+    email: Optional[str] = None
+    provider_user_id: Optional[str] = None
+    suggested_username: Optional[str] = None
+
 class SocialRegisterRequest(BaseModel):
     access_token: str
     username: str
@@ -583,6 +494,14 @@ class SocialRegisterRequest(BaseModel):
     age: Optional[int] = None
     activity_level: Optional[str] = None
     goal_type: Optional[str] = "maintain"
+
+
+def _fallback_user_id(provider_user_id: Optional[str], email: Optional[str]) -> str:
+    if email:
+        return email
+    if provider_user_id:
+        return f"supabase:{provider_user_id}"
+    return uuid4().hex
 
 @app.get("/api/auth/oauth/url")
 def get_oauth_url(provider: str = "google"):
@@ -596,7 +515,8 @@ def get_oauth_url(provider: str = "google"):
         resp = supabase.auth.sign_in_with_oauth({
             "provider": provider,
             "options": {
-                "redirect_to": redirect_to
+                "redirect_to": redirect_to,
+                "scopes": "email profile",
             }
         })
 
@@ -610,12 +530,12 @@ def get_oauth_url(provider: str = "google"):
             detail=f"OAuth URL 생성 중 오류가 발생했습니다: {str(e)}"
         )
 
-@app.post("/api/auth/social-check")
+@app.post("/api/auth/social-check", response_model=SocialCheckResponse)
 def check_social_user(payload: SocialCheckRequest, db: Session = Depends(get_db)):
     """
     소셜 로그인 후 가입 여부 확인
     - 가입되어 있으면: 로그인 처리 결과 반환
-    - 가입 안되어 있으면: 자동 가입 후 반환 (현재 코드 정책)
+    - 가입 안되어 있으면: registered=False 반환
     """
     try:
         # 1. 토큰 검증
@@ -629,68 +549,32 @@ def check_social_user(payload: SocialCheckRequest, db: Session = Depends(get_db)
         print(f"Social check failed: {e}")
         raise HTTPException(status_code=400, detail=str(e))
 
+    email = user_data.email
+    suggested_username = (
+        user_data.user_metadata.get("full_name")
+        or user_data.user_metadata.get("name")
+        or (email.split("@")[0] if email else None)
+    )
+
     # 2. DB 조회
     existing_user = db.query(User).filter(User.provider_user_id == user_data.id).first()
-    
+
     if existing_user:
         return {
             "registered": True,
             "user_number": existing_user.user_number,
             "id": existing_user.id,
             "username": existing_user.username,
-            "message": "로그인 성공"
+            "message": "로그인 성공",
+            "suggested_username": suggested_username,
         }
-    
-    # 3. 없으면 자동 가입 (사용자 요청 반영: 소셜 로그인 시 무조건 DB 저장)
-    # ID는 이메일이나 난수로 생성, 비밀번호는 사용 안 함(Dummy)
-    provider_user_id = user_data.id
-    email = user_data.email
-    if not email:
-        raise HTTPException(status_code=400, detail="이메일 정보를 가져올 수 없습니다.")
 
-    new_username = (
-        user_data.user_metadata.get("full_name") 
-        or user_data.user_metadata.get("name") 
-        or email.split("@")[0]
-    )
-
-    new_user = User(
-        id=email, 
-        username=new_username,
-        password=uuid4().hex, # 비밀번호 미사용
-        provider_user_id=provider_user_id,
-        email=email,
-        role="user"
-    )
-    db.add(new_user)
-    db.flush() # user_number 생성을 위해 필수
-
-    # 기본 프로필 생성
-    new_profile = UserProfile(
-        user_number=new_user.user_number,
-        goal_type="maintain", # 기본값
-        activity_level="sedentary" # 기본값
-    )
-    db.add(new_profile)
-
-    # 기본 목표 생성
-    goal = UserGoal(
-        user_number=new_user.user_number,
-        id=new_user.id,
-        goal_type="maintain",
-        start_date=datetime.now(timezone.utc),
-    )
-    db.add(goal)
-
-    db.commit()
-    db.refresh(new_user)
-
+    # 3. 가입 안되어 있으면 프론트에서 social-register 호출
     return {
-        "registered": True,
-        "user_number": new_user.user_number,
-        "id": new_user.id,
-        "username": new_user.username,
-        "message": "회원가입 및 로그인 성공"
+        "registered": False,
+        "email": email,
+        "provider_user_id": user_data.id,
+        "suggested_username": suggested_username,
     }
 
 
@@ -709,9 +593,6 @@ def register_social_user(payload: SocialRegisterRequest, db: Session = Depends(g
         provider_user_id = user_data.id
         email = user_data.email
 
-        if not email:
-            raise HTTPException(status_code=400, detail="이메일 정보를 가져올 수 없습니다.")
-
         # 2) 중복 확인
         exists = db.query(User).filter(User.provider_user_id == provider_user_id).first()
         if exists:
@@ -719,7 +600,7 @@ def register_social_user(payload: SocialRegisterRequest, db: Session = Depends(g
 
         # 3) User 생성
         new_user = User(
-            id=email,  # 로컬 로그인 id 컬럼을 이메일로 사용
+            id=_fallback_user_id(provider_user_id, email),
             username=payload.username,
             password=uuid4().hex,  # 소셜은 비밀번호 미사용이므로 더미
             provider_user_id=provider_user_id,
@@ -767,156 +648,6 @@ def register_social_user(payload: SocialRegisterRequest, db: Session = Depends(g
         db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
 
-# --- Social Login & Registration ---
-
-class SocialCheckRequest(BaseModel):
-    access_token: str
-
-class SocialRegisterRequest(BaseModel):
-    access_token: str
-    username: str
-    height: Optional[float] = None
-    weight: Optional[float] = None
-    gender: Optional[str] = None
-    age: Optional[int] = None
-    activity_level: Optional[str] = None
-    goal_type: Optional[str] = "maintain"
-
-@app.get("/api/auth/oauth/url")
-def get_oauth_url(provider: str = "google"):
-    """
-    Supabase OAuth 로그인 URL 생성 후 바로 리다이렉트
-    (공식 supabase-py 패턴: sign_in_with_oauth 사용)
-    """
-    try:
-        redirect_to = "http://localhost:3000/login/callback"  # ✅ 너 프론트에서 쓰는 콜백으로 맞추기
-
-        resp = supabase.auth.sign_in_with_oauth({
-            "provider": provider,
-            "options": {
-                "redirect_to": redirect_to
-            }
-        })
-
-        # ✅ 브라우저가 이 엔드포인트로 오면 구글 로그인 페이지로 바로 이동
-        return RedirectResponse(url=resp.url, status_code=302)
-
-    except Exception as e:
-        print(f"OAuth URL generation error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"OAuth URL 생성 중 오류가 발생했습니다: {str(e)}"
-        )
-
-@app.post("/api/auth/social-check")
-def check_social_user(payload: SocialCheckRequest, db: Session = Depends(get_db)):
-    """
-    소셜 로그인 후 가입 여부 확인
-    - 가입되어 있으면: 로그인 처리 결과 반환 (토큰은 이미 프론트가 가지고 있음)
-    - 가입 안되어 있으면: registered=False 반환
-    """
-    try:
-        # 1. 토큰 검증
-        user_response = supabase.auth.get_user(payload.access_token)
-        user_data = user_response.user
-        
-        if not user_data:
-            raise HTTPException(status_code=401, detail="Invalid token")
-
-        # 2. DB 조회
-        existing_user = db.query(User).filter(User.provider_user_id == user_data.id).first()
-        
-        if existing_user:
-             return {
-                "registered": True,
-                "user_number": existing_user.user_number,
-                "id": existing_user.id,
-                "username": existing_user.username,
-                "message": "로그인 성공"
-            }
-        else:
-            return {
-                "registered": False,
-                "email": user_data.email,
-                "provider_user_id": user_data.id
-            }
-
-    except Exception as e:
-        print(f"Social check failed: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.post("/api/auth/social-register")
-def register_social_user(payload: SocialRegisterRequest, db: Session = Depends(get_db)):
-    """
-    소셜 로그인 후 추가 정보를 입력받아 회원가입 완료
-    """
-    try:
-        # 1. 토큰 검증
-        user_response = supabase.auth.get_user(payload.access_token)
-        user_data = user_response.user
-        
-        if not user_data:
-            raise HTTPException(status_code=401, detail="Invalid token")
-            
-        provider_user_id = user_data.id
-        email = user_data.email
-        
-        # 2. 중복 확인 (혹시나)
-        if db.query(User).filter(User.provider_user_id == provider_user_id).first():
-             raise HTTPException(status_code=400, detail="이미 가입된 사용자입니다.")
-
-        # 3. User 생성
-        new_user = User(
-            id=email, 
-            username=payload.username,
-            password=uuid4().hex, # 비밀번호 미사용
-            provider_user_id=provider_user_id,
-            email=email,
-            role="user"
-        )
-        db.add(new_user)
-        db.commit()
-        db.refresh(new_user)
-        
-        # 4. Profile 생성
-        new_profile = UserProfile(
-            user_number=new_user.user_number,
-            height=payload.height,
-            weight=payload.weight,
-            age=payload.age,
-            gender=payload.gender,
-            activity_level=normalize_activity_level(payload.activity_level) if payload.activity_level else "sedentary",
-            goal_type=payload.goal_type
-        )
-        db.add(new_profile)
-        
-        # 5. Goal 생성 (기본값)
-        if payload.goal_type:
-             bmr = None # 계산 필요하면 여기서 계산 로직 추가
-             # 간단히 maintain으로 초기화
-             goal = UserGoal(
-                user_number=new_user.user_number,
-                id=new_user.id,
-                goal_type=payload.goal_type,
-                start_date=datetime.now(timezone.utc)
-             )
-             db.add(goal)
-
-        db.commit()
-        
-        return {
-            "registered": True,
-            "user_number": new_user.user_number,
-            "id": new_user.id,
-            "username": new_user.username,
-            "message": "회원가입 완료"
-        }
-
-    except Exception as e:
-        db.rollback()
-        print(f"Social registration failed: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
-
 @app.get("/api/me", response_model=AuthResponse)
 def read_users_me(current_user: User = Depends(get_current_user_from_token)):
     """
@@ -931,34 +662,32 @@ def read_users_me(current_user: User = Depends(get_current_user_from_token)):
 
 
 @app.post("/api/logout", response_model=LogoutResponse)
-def logout(request: Request):
-    """로그아웃 (서버 상태 없음)"""
-    request.session.clear()
+def logout():
+    """로그아웃 (JWT 환경에서는 클라이언트에서 토큰 폐기)"""
     return {"message": "로그아웃 성공"}
 
 
 @app.get("/api/user", response_model=UserResponse)
-def get_user(request: Request, id: Optional[str] = None, user_number: int = 1, db: Session = Depends(get_db)):
+def get_user(current_user: User = Depends(get_current_user_from_token)):
     """사용자 기본 정보 조회"""
-    user = _resolve_user_from_session_or_params(request, db, id, user_number)
-    if not user:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="사용자를 찾을 수 없습니다.")
     return {
-        "user_number": user.user_number,
-        "id": user.id,
-        "username": user.username,
-        "email": user.email,
-        "role": user.role,
+        "user_number": current_user.user_number,
+        "id": current_user.id,
+        "username": current_user.username,
+        "email": current_user.email,
+        "role": current_user.role,
     }
 
 
 @app.get("/api/user/goal", response_model=UserGoalResponse)
-def get_user_goal(request: Request, user_number: int = 1, db: Session = Depends(get_db)):
+def get_user_goal(
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
     """사용자 목표 조회"""
-    user = _resolve_user_from_session_or_params(request, db, None, user_number)
     goal = (
         db.query(UserGoal)
-        .filter(UserGoal.user_number == user.user_number)
+        .filter(UserGoal.user_number == current_user.user_number)
         .order_by(UserGoal.created_at.desc())
         .first()
     )
@@ -980,7 +709,11 @@ def get_user_goal(request: Request, user_number: int = 1, db: Session = Depends(
 
 
 @app.post("/api/user/goal", response_model=UserGoalResponse)
-def upsert_user_goal(payload: UserGoalUpdateRequest, db: Session = Depends(get_db)):
+def upsert_user_goal(
+    payload: UserGoalUpdateRequest,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
     """사용자 목표 변경(없으면 생성)"""
     goal_type = _normalize_goal_type(payload.goal_type)
     if goal_type not in {"diet", "maintain", "bulk"}:
@@ -989,14 +722,12 @@ def upsert_user_goal(payload: UserGoalUpdateRequest, db: Session = Depends(get_d
             detail="goal_type은 diet/maintain/bulk 중 하나여야 합니다.",
         )
 
-    user = db.query(User).filter(User.user_number == payload.user_number).one_or_none()
-    if not user:
-        raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
+    user = current_user
 
-    profile = db.query(UserProfile).filter(UserProfile.user_number == payload.user_number).one_or_none()
+    profile = db.query(UserProfile).filter(UserProfile.user_number == user.user_number).one_or_none()
     latest_inbody = (
         db.query(InBodyRecord)
-        .filter(InBodyRecord.user_number == payload.user_number)
+        .filter(InBodyRecord.user_number == user.user_number)
         .order_by(InBodyRecord.created_at.desc())
         .first()
     )
@@ -1014,7 +745,7 @@ def upsert_user_goal(payload: UserGoalUpdateRequest, db: Session = Depends(get_d
 
     latest_goal = (
         db.query(UserGoal)
-        .filter(UserGoal.user_number == payload.user_number)
+        .filter(UserGoal.user_number == user.user_number)
         .order_by(UserGoal.created_at.desc())
         .first()
     )
@@ -1025,7 +756,7 @@ def upsert_user_goal(payload: UserGoalUpdateRequest, db: Session = Depends(get_d
         goal = latest_goal
     else:
         goal = UserGoal(
-            user_number=payload.user_number,
+            user_number=user.user_number,
             id=user.id,
             goal_type=goal_type,
             target_calorie=target_calorie,
@@ -1054,11 +785,11 @@ def upsert_user_goal(payload: UserGoalUpdateRequest, db: Session = Depends(get_d
 @app.post("/api/diet-plan", response_model=OneDayMealPlan)
 def generate_1day_diet_plan(
     payload: DietPlan3DaysRequest,
-    request: Request,
+    current_user: User = Depends(get_current_user_from_token),
     db: Session = Depends(get_db),
 ):
     """인바디 기반 1일 식단 추천 (OpenAI)"""
-    user = _resolve_user_from_session_or_params(request, db, payload.id, payload.user_number)
+    user = current_user
 
     profile = (
         db.query(UserProfile)
@@ -1212,11 +943,11 @@ def generate_1day_diet_plan(
 @app.post("/api/plan/record", response_model=PlanRecordCreateResult)
 def create_records_from_plan(
     payload: PlanRecordCreateRequest,
-    request: Request,
+    current_user: User = Depends(get_current_user_from_token),
     db: Session = Depends(get_db),
 ):
     """체크된 식단 항목을 오늘 기록으로 저장"""
-    user = _resolve_user_from_session_or_params(request, db, payload.id, payload.user_number)
+    user = current_user
 
     if not payload.meals:
         raise HTTPException(status_code=400, detail="meals가 비어 있습니다.")
@@ -1268,13 +999,11 @@ def create_records_from_plan(
 
 @app.get("/api/intake/today", response_model=TodayIntakeResponse)
 def get_today_intake_from_plan(
-    request: Request,
-    id: Optional[str] = None,
-    user_number: Optional[int] = None,
+    current_user: User = Depends(get_current_user_from_token),
     db: Session = Depends(get_db),
 ):
     """최신 1일 식단 계획에서 총 영양정보 반환"""
-    user = _resolve_user_from_session_or_params(request, db, id, user_number)
+    user = current_user
 
     plan_record = (
         db.query(UserDietPlan)
@@ -1306,7 +1035,11 @@ def get_today_intake_from_plan(
 
 
 @app.post("/api/user/activity-level")
-def update_activity_level(payload: ActivityLevelUpdateRequest, db: Session = Depends(get_db)):
+def update_activity_level(
+    payload: ActivityLevelUpdateRequest,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
     """사용자 활동 수준 업데이트"""
     level = normalize_activity_level(payload.activity_level)
     if level not in ACTIVITY_FACTORS:
@@ -1315,23 +1048,25 @@ def update_activity_level(payload: ActivityLevelUpdateRequest, db: Session = Dep
             detail="activity_level은 sedentary/light/moderate/active 중 하나여야 합니다.",
         )
 
-    profile = db.query(UserProfile).filter(UserProfile.user_number == payload.user_number).one_or_none()
+    profile = db.query(UserProfile).filter(UserProfile.user_number == current_user.user_number).one_or_none()
     if not profile:
-        profile = UserProfile(user_number=payload.user_number)
+        profile = UserProfile(user_number=current_user.user_number)
         db.add(profile)
 
     profile.activity_level = level
     db.commit()
-    return {"user_number": payload.user_number, "activity_level": level, "factor": ACTIVITY_FACTORS[level]}
+    return {"user_number": current_user.user_number, "activity_level": level, "factor": ACTIVITY_FACTORS[level]}
 
 
 @app.get("/api/inbody", response_model=Optional[InBodyHistoryResponse])
-def get_latest_inbody(request: Request, user_number: int = 1, db: Session = Depends(get_db)):
+def get_latest_inbody(
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
     """사용자 최신 인바디 기록 조회"""
-    user = _resolve_user_from_session_or_params(request, db, None, user_number)
     record = (
         db.query(InBodyRecord)
-        .filter(InBodyRecord.user_number == user.user_number)
+        .filter(InBodyRecord.user_number == current_user.user_number)
         .order_by(InBodyRecord.created_at.desc())
         .first()
     )
@@ -1363,15 +1098,13 @@ def get_latest_inbody(request: Request, user_number: int = 1, db: Session = Depe
 
 @app.get("/api/mypage", response_model=MyPageEnvelopeResponse)
 def get_mypage_records(
-    request: Request,
-    id: Optional[str] = None,
-    user_number: int = 1,
+    current_user: User = Depends(get_current_user_from_token),
     limit: int = 10,
     db: Session = Depends(get_db),
 ):
     """마이페이지 식단 기록 조회"""
-    user = _resolve_user_from_session_or_params(request, db, id, user_number)
-    user_number = user.user_number
+    user = current_user
+    user_number = current_user.user_number
     latest_inbody = (
         db.query(InBodyRecord)
         .filter(InBodyRecord.user_number == user_number)
@@ -1460,10 +1193,10 @@ def get_mypage_records(
     }
 
 
-@app.post("/api/daily-activities/sync", response_model=List[DailyActivityUpsertResult])
-def sync_daily_activities(
+def _sync_daily_activities(
     activities: List[DailyActivityIn],
-    db: Session = Depends(get_db),
+    db: Session,
+    user_number: int,
 ):
     """
     일일 활동 데이터 업서트 (source_record_id 있으면 그 기준, 없으면 날짜+타입 기준).
@@ -1484,13 +1217,13 @@ def sync_daily_activities(
 
         if item.activity_source_record_id:
             existing = db.query(DailyActivity).filter(
-                DailyActivity.user_number == item.user_number,
+                DailyActivity.user_number == user_number,
                 DailyActivity.activity_source == item.activity_source,
                 DailyActivity.activity_source_record_id == item.activity_source_record_id,
             ).first()
         else:
             existing = db.query(DailyActivity).filter(
-                DailyActivity.user_number == item.user_number,
+                DailyActivity.user_number == user_number,
                 DailyActivity.activity_date == item.activity_date,
                 DailyActivity.activity_type == item.activity_type,
                 DailyActivity.activity_source_record_id.is_(None),
@@ -1518,7 +1251,7 @@ def sync_daily_activities(
             updated_count += 1
         else:
             new_activity = DailyActivity(
-                user_number=item.user_number,
+                user_number=user_number,
                 activity_date=item.activity_date,
                 activity_type=item.activity_type,
                 steps=item.steps,
@@ -1549,9 +1282,19 @@ def sync_daily_activities(
     return results
 
 
+@app.post("/api/daily-activities/sync", response_model=List[DailyActivityUpsertResult])
+def sync_daily_activities(
+    activities: List[DailyActivityIn],
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    return _sync_daily_activities(activities, db, current_user.user_number)
+
+
 @app.post("/api/health-connect/sync", response_model=List[DailyActivityUpsertResult])
 def sync_health_connect_activities(
     activities: List[DailyActivityIn],
+    current_user: User = Depends(get_current_user_from_token),
     db: Session = Depends(get_db),
 ):
     """
@@ -1563,17 +1306,20 @@ def sync_health_connect_activities(
         data = item.model_dump()
         data["activity_source"] = "health_connect"
         normalized.append(DailyActivityIn(**data))
-    return sync_daily_activities(normalized, db)
+    return _sync_daily_activities(normalized, db, current_user.user_number)
 
 
 @app.get("/api/inbody-history", response_model=List[InBodyHistoryResponse])
-def get_inbody_history(request: Request, user_number: int = 1, limit: int = 10, db: Session = Depends(get_db)):
+def get_inbody_history(
+    current_user: User = Depends(get_current_user_from_token),
+    limit: int = 10,
+    db: Session = Depends(get_db),
+):
     """
     사용자의 인바디 측정 히스토리 조회
     """
-    user = _resolve_user_from_session_or_params(request, db, None, user_number)
     records = db.query(InBodyRecord).filter(
-        InBodyRecord.user_number == user.user_number
+        InBodyRecord.user_number == current_user.user_number
     ).order_by(InBodyRecord.created_at.desc()).limit(limit).all()
     
     return [
@@ -1605,17 +1351,14 @@ def get_inbody_history(request: Request, user_number: int = 1, limit: int = 10, 
 
 @app.post("/api/inbody-ocr", response_model=InBodyOcrResponse)
 async def inbody_ocr(
-    request: Request,
-    id: Optional[str] = Form(None),
-    user_number: Optional[int] = Form(None),
+    current_user: User = Depends(get_current_user_from_token),
     image: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
     """
     인바디 사진 OCR -> 핵심 항목 추출 -> users 테이블 최신값 업데이트
     """
-    user = _resolve_user_from_session_or_params(request, db, id, user_number)
-    user_number = user.user_number
+    user_number = current_user.user_number
 
     if not image.content_type or not image.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="이미지 파일만 업로드 가능합니다.")
@@ -1680,17 +1423,14 @@ async def inbody_ocr(
 
 @app.post("/api/inbody-ocr/upload", response_model=InBodyOcrResponse)
 async def inbody_ocr_upload(
-    request: Request,
-    id: Optional[str] = Form(None),
-    user_number: Optional[int] = Form(None),
+    current_user: User = Depends(get_current_user_from_token),
     image: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
     """
     인바디 사진 OCR -> 핵심 항목 추출 -> users 테이블 최신값 업데이트
     """
-    user = _resolve_user_from_session_or_params(request, db, id, user_number)
-    user_number = user.user_number
+    user_number = current_user.user_number
 
     if not image.content_type or not image.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="이미지 파일만 업로드 가능합니다.")
@@ -1754,11 +1494,14 @@ async def inbody_ocr_upload(
 
 
 @app.get("/api/record")
-def get_record(date: str, user_number: int = 3, db: Session = Depends(get_db)):
+def get_record(
+    date: str,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
     """
     특정 날짜의 식단 기록 조회
     - date: "YYYY-MM-DD"
-    - user_number: 테스트 기본값 3 (나중에 로그인 연동)
     """
     try:
         day = datetime.strptime(date, "%Y-%m-%d")
@@ -1769,7 +1512,7 @@ def get_record(date: str, user_number: int = 3, db: Session = Depends(get_db)):
     end = day + timedelta(days=1)
 
     rows = db.query(Record).filter(
-        Record.user_number == user_number,
+        Record.user_number == current_user.user_number,
         Record.record_created_at >= start,
         Record.record_created_at < end,
     ).order_by(Record.record_created_at.desc()).all()
@@ -1793,16 +1536,13 @@ def get_record(date: str, user_number: int = 3, db: Session = Depends(get_db)):
 @app.delete("/api/record/{record_id}", response_model=RecordDeleteResponse)
 def delete_record(
     record_id: int,
-    request: Request,
-    id: Optional[str] = None,
-    user_number: int = 1,
+    current_user: User = Depends(get_current_user_from_token),
     db: Session = Depends(get_db),
 ):
     """식단 기록 삭제"""
-    user = _resolve_user_from_session_or_params(request, db, id, user_number)
     record = (
         db.query(Record)
-        .filter(Record.record_id == record_id, Record.user_number == user.user_number)
+        .filter(Record.record_id == record_id, Record.user_number == current_user.user_number)
         .first()
     )
     if not record:
@@ -1812,15 +1552,17 @@ def delete_record(
     db.commit()
 
     return {"record_id": record_id, "message": "식단 기록이 삭제되었습니다."}
+
 @app.post("/api/vision/food")
 async def vision_food(
-    user_number: int = Form(...),
+    current_user: User = Depends(get_current_user_from_token),
     meal_type: str = Form(...),
     record_date: Optional[str] = Form(None),
     image: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
     try:
+        user_number = current_user.user_number
         ext = (Path(image.filename).suffix or ".jpg").lower()
         filename = f"{uuid4().hex}{ext}"
         save_path = UPLOAD_DIR / filename
@@ -1900,16 +1642,20 @@ def classify_endpoint(payload: InbodyInput):
 
 
 @app.post("/api/classify/bodytype/by-user", response_model=BodyTypeResult)
-def classify_by_user(payload: BodyTypeFromUserRequest, db: Session = Depends(get_db)):
+def classify_by_user(
+    payload: BodyTypeFromUserRequest,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
     record = db.query(InBodyRecord).filter(
-        InBodyRecord.user_number == payload.user_number
+        InBodyRecord.user_number == current_user.user_number
     ).order_by(InBodyRecord.created_at.desc()).first()
 
     if not record:
         raise HTTPException(status_code=404, detail="인바디 기록이 없습니다.")
 
     profile = db.query(UserProfile).filter(
-        UserProfile.user_number == payload.user_number
+        UserProfile.user_number == current_user.user_number
     ).one_or_none()
 
     if not profile or not profile.gender:
