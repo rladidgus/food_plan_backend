@@ -18,6 +18,8 @@ postgres_data/
 .vscode/
 .idea/
 .DS_Store
+# uploads (runtime-generated)
+uploads/
 # local env files
 .env.local
 .env.prod
