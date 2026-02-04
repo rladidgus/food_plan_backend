@@ -1723,32 +1723,6 @@ def get_record(
         }
         for r in rows
     ]
-@app.delete("/api/record", status_code=204)
-def delete_day_records(
-    date: str = Query(..., description="YYYY-MM-DD"),
-    current_user: User = Depends(get_current_user_from_token),
-    db: Session = Depends(get_db),
-):
-    """
-    특정 날짜의 식단 기록 전체 삭제
-    - date: "YYYY-MM-DD"
-    """
-    try:
-        day = datetime.strptime(date, "%Y-%m-%d")
-    except ValueError:
-        raise HTTPException(status_code=400, detail="date는 YYYY-MM-DD 형식이어야 합니다.")
-
-    start = day
-    end = day + timedelta(days=1)
-
-    db.query(Record).filter(
-        Record.user_number == current_user.user_number,
-        Record.record_created_at >= start,
-        Record.record_created_at < end,
-    ).delete(synchronize_session=False)
-
-    db.commit()
-    return
 
 @app.get("/api/calendar", response_model=CalendarMarkedDatesResponse)
 def get_calendar_marked_dates(

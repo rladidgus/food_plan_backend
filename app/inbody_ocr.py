@@ -148,7 +148,7 @@ def extract_key_values(text: str) -> dict:
     }
 
     def parse_number(raw: str):
-        raw = raw.replace(",", "").strip()
+        raw = raw.replace(",", "").replace(" ", "").strip()
         try:
             return float(raw)
         except ValueError:
@@ -171,11 +171,12 @@ def extract_key_values(text: str) -> dict:
 
     def pick_value_from_window(window_lines, key):
         # 단위 있는 숫자를 우선 찾고, 없으면 일반 숫자
-        unit_pattern = r"([0-9]+(?:[.,][0-9]+)?)\s*(cm|kg|%|kcal)?"
+        unit_pattern = r"([0-9]+(?:[.,\s][0-9]+)?)\s*(cm|kg|%|kcal)?"
+        
         if key == "inbody_score":
             # "/100" 형태를 최우선 (예: 68 / 100 점)
             for line in window_lines:
-                m = re.search(r"([0-9]+(?:[.,][0-9]+)?)\s*/\s*100", line)
+                m = re.search(r"([0-9]+(?:[.,\s][0-9]+)?)\s*/\s*100", line)
                 if m:
                     val = parse_number(m.group(1))
                     if val is not None:
@@ -188,7 +189,7 @@ def extract_key_values(text: str) -> dict:
                 if re.search(r"(넘을 수|종합점수|점수입니다|만점)", line):
                     continue
 
-                m = re.search(r"([0-9]+(?:[.,][0-9]+)?)\s*점", line)
+                m = re.search(r"([0-9]+(?:[.,\s][0-9]+)?)\s*점", line)
                 if m:
                     val = parse_number(m.group(1))
                     if val is not None:
@@ -197,34 +198,193 @@ def extract_key_values(text: str) -> dict:
                             return val
             # "인바디점수 68" 형태 보조
             for line in window_lines:
-                m = re.search(r"(인바디\s*점수|인바디점수|Score|Scon)\s*[:\-]?\s*([0-9]+(?:[.,][0-9]+)?)", line)
+                m = re.search(r"(인바디\s*점수|인바디점수|Score|Scon)\s*[:\-]?\s*([0-9]+(?:[.,\s][0-9]+)?)", line)
                 if m:
                     val = parse_number(m.group(2))
                     if val is not None:
                         lo, hi = ranges.get(key, (None, None))
                         if lo is None or (lo <= val <= hi):
                             return val
-        if key == "weight":
-            # "체중 89.5" 또는 "체중 (kg) 89.5" 형태 우선
+        
+        if key == "height":
+            # 1순위: "신장" 바로 옆 또는 다음 줄의 "숫자cm" 형태
             for line in window_lines:
-                if re.search(r"(체중|Weight)", line, re.IGNORECASE) and not re.search(r"(적정체중|체중조절)", line):
-                    m = re.search(r"(체중|Weight)[^0-9]*([0-9]+(?:[.,][0-9]+)?)", line, re.IGNORECASE)
-                    if m:
-                        val = parse_number(m.group(2))
-                        if val is not None:
-                            lo, hi = ranges.get(key, (None, None))
-                            if lo is None or (lo <= val <= hi):
-                                return val
-            # "체중 (kg)" 다음 줄에 값이 있는 경우
-            for line in window_lines:
-                if re.search(r"(체중|Weight).*kg", line, re.IGNORECASE) and not re.search(r"(적정체중|체중조절)", line):
-                    m = re.search(r"([0-9]+(?:[.,][0-9]+)?)", line)
+                # "신장 165.6cm" 또는 "165. 6cm" 형태
+                if re.search(r"신장", line):
+                    m = re.search(r"([0-9]+(?:\.\s*[0-9]+)?)\s*cm", line)
                     if m:
                         val = parse_number(m.group(1))
                         if val is not None:
                             lo, hi = ranges.get(key, (None, None))
                             if lo is None or (lo <= val <= hi):
                                 return val
+            # 2순위: 헤더 줄 근처의 cm이 붙은 숫자
+            for line in window_lines:
+                m = re.search(r"([0-9]+(?:\.\s*[0-9]+)?)\s*cm", line)
+                if m:
+                    val = parse_number(m.group(1))
+                    if val is not None:
+                        lo, hi = ranges.get(key, (None, None))
+                        if lo is None or (lo <= val <= hi):
+                            return val
+        
+        if key == "weight":
+            # 1순위: "Weight" 영어 키워드 바로 뒤의 숫자 (가장 정확)
+            for idx, line in enumerate(window_lines):
+                # "Weight 52.3" 또는 "Weight 52. 3" 형태
+                m = re.search(r"Weight\s+([0-9]+(?:\.\s*[0-9]+)?)", line, re.IGNORECASE)
+                if m:
+                    val = parse_number(m.group(1))
+                    if val is not None:
+                        lo, hi = ranges.get(key, (None, None))
+                        if lo is None or (lo <= val <= hi):
+                            return val
+                # "Weight" 키워드만 있고 숫자가 없으면 이전 줄 체크
+                if re.search(r"^Weight\s*$", line, re.IGNORECASE) and idx > 0:
+                    prev_line = window_lines[idx - 1]
+                    # 이전 줄에서 숫자 찾기 (단, 그래프 눈금 제외)
+                    matches = list(re.finditer(r"([0-9]+(?:\.\s*[0-9]+)?)", prev_line))
+                    if len(matches) <= 2:  # 숫자가 2개 이하면 실제 값일 가능성 높음
+                        for m in matches:
+                            val = parse_number(m.group(1))
+                            if val is not None:
+                                lo, hi = ranges.get(key, (None, None))
+                                if lo is None or (lo <= val <= hi):
+                                    return val
+            
+            # 2순위: "체중 (kg)" 같은 줄에 있는 숫자 (조절/적정 제외)
+            for line in window_lines:
+                if re.search(r"체중\s*\(kg\)", line) and not re.search(r"(적정체중|체중조절)", line):
+                    # 괄호 뒤의 숫자만 추출
+                    m = re.search(r"체중\s*\(kg\)[^0-9]*([0-9]+(?:\.\s*[0-9]+)?)", line)
+                    if m:
+                        val = parse_number(m.group(1))
+                        if val is not None:
+                            lo, hi = ranges.get(key, (None, None))
+                            if lo is None or (lo <= val <= hi):
+                                return val
+        
+        # 골격근량 부분만 수정된 코드 (기존 app.py의 pick_value_from_window 함수 내부)
+
+        if key == "skeletal_muscle_mass":
+            # 0순위: "연구항목" 섹션의 "골격근량 40.3 kg" 형태 (가장 정확)
+            for line in window_lines:
+                if re.search(r"골격근량\s+([0-9]+(?:\.\s*[0-9]+)?)\s*kg", line):
+                    m = re.search(r"골격근량\s+([0-9]+(?:\.\s*[0-9]+)?)\s*kg", line)
+                    if m:
+                        val = parse_number(m.group(1))
+                        if val is not None:
+                            lo, hi = ranges.get(key, (None, None))
+                            if lo is None or (lo <= val <= hi):
+                                return val
+            
+            # 1순위: "Skeletal Muscle Mass" 바로 뒤의 숫자
+            for idx, line in enumerate(window_lines):
+                m = re.search(r"Skeletal\s*Mu[sc][sc]le\s*Mass\s+([0-9]+(?:\.\s*[0-9]+)?)", line, re.IGNORECASE)
+                if m:
+                    val = parse_number(m.group(1))
+                    if val is not None:
+                        lo, hi = ranges.get(key, (None, None))
+                        if lo is None or (lo <= val <= hi):
+                            return val
+                # "Skeletal Muscle Mass" 키워드만 있고 숫자가 없으면 이전 줄 체크
+                if re.search(r"Skeletal\s*Mu[sc][sc]le\s*Mass", line, re.IGNORECASE) and idx > 0:
+                    prev_line = window_lines[idx - 1]
+                    # 이전 줄에서 "(kg) 40.3" 형태 찾기
+                    m = re.search(r"\(kg\)\s*([0-9]+(?:\.\s*[0-9]+)?)", prev_line)
+                    if m:
+                        val = parse_number(m.group(1))
+                        if val is not None:
+                            lo, hi = ranges.get(key, (None, None))
+                            if lo is None or (lo <= val <= hi):
+                                return val
+                    # "(kg)"이 없어도 숫자가 단독으로 있으면 추출 (그래프 눈금 제외)
+                    matches = list(re.finditer(r"([0-9]+(?:\.\s*[0-9]+)?)", prev_line))
+                    if 1 <= len(matches) <= 2:  # 숫자가 1-2개면 실제 값일 가능성
+                        for m in matches:
+                            val = parse_number(m.group(1))
+                            if val is not None:
+                                lo, hi = ranges.get(key, (None, None))
+                                if lo is None or (lo <= val <= hi):
+                                    return val
+            
+            # 2순위: "골격근량 (kg)" 헤더 다음 줄의 단독 숫자
+            for idx, line in enumerate(window_lines):
+                if re.search(r"골격근량\s*\(kg\)$", line.strip()) and idx + 1 < len(window_lines):
+                    next_line = window_lines[idx + 1]
+                    # 다음 줄에 숫자가 적으면 (그래프 눈금이 아님)
+                    matches = list(re.finditer(r"([0-9]+(?:\.\s*[0-9]+)?)", next_line))
+                    if 1 <= len(matches) <= 2:
+                        for m in matches:
+                            val = parse_number(m.group(1))
+                            if val is not None:
+                                lo, hi = ranges.get(key, (None, None))
+                                if lo is None or (lo <= val <= hi):
+                                    return val
+        
+        if key == "body_fat_pct":
+            # 1순위: "Percent Body Fat" 바로 뒤의 숫자
+            for idx, line in enumerate(window_lines):
+                m = re.search(r"Percent\s*Body\s*Fat\s+([0-9]+(?:\.\s*[0-9]+)?)", line, re.IGNORECASE)
+                if m:
+                    val = parse_number(m.group(1))
+                    if val is not None:
+                        lo, hi = ranges.get(key, (None, None))
+                        if lo is None or (lo <= val <= hi):
+                            return val
+                # "Percent Body Fat" 키워드만 있고 숫자가 없으면 이전 줄 체크
+                if re.search(r"Percent\s*Body\s*Fat", line, re.IGNORECASE) and idx > 0:
+                    prev_line = window_lines[idx - 1]
+                    m = re.search(r"([0-9]+(?:\.\s*[0-9]+)?)", prev_line)
+                    if m:
+                        val = parse_number(m.group(1))
+                        if val is not None:
+                            lo, hi = ranges.get(key, (None, None))
+                            if lo is None or (lo <= val <= hi):
+                                return val
+            # 2순위: "체지방률 (%)" 같은 줄
+            for line in window_lines:
+                if re.search(r"체지방률\s*\(%\)", line):
+                    m = re.search(r"체지방률\s*\(%\)[^0-9]*([0-9]+(?:\.\s*[0-9]+)?)", line)
+                    if m:
+                        val = parse_number(m.group(1))
+                        if val is not None:
+                            lo, hi = ranges.get(key, (None, None))
+                            if lo is None or (lo <= val <= hi):
+                                return val
+        
+        if key == "body_fat_mass":
+            # 1순위: "Body Fat Mass" 바로 뒤의 숫자
+            for idx, line in enumerate(window_lines):
+                m = re.search(r"Body\s*Fat\s*Ma[sr]s\s+([0-9]+(?:\.\s*[0-9]+)?)", line, re.IGNORECASE)
+                if m:
+                    val = parse_number(m.group(1))
+                    if val is not None:
+                        lo, hi = ranges.get(key, (None, None))
+                        if lo is None or (lo <= val <= hi):
+                            return val
+                # "Body Fat Mass" 키워드만 있고 숫자가 없으면 이전 줄 체크
+                if re.search(r"Body\s*Fat\s*Ma[sr]s", line, re.IGNORECASE) and idx > 0:
+                    prev_line = window_lines[idx - 1]
+                    m = re.search(r"\(kg\)\s*([0-9]+(?:\.\s*[0-9]+)?)", prev_line)
+                    if m:
+                        val = parse_number(m.group(1))
+                        if val is not None:
+                            lo, hi = ranges.get(key, (None, None))
+                            if lo is None or (lo <= val <= hi):
+                                return val
+            # 2순위: "체지방량 (kg)" 같은 줄
+            for line in window_lines:
+                if re.search(r"체지방량\s*\(kg\)", line):
+                    m = re.search(r"체지방량\s*\(kg\)[^0-9]*([0-9]+(?:\.\s*[0-9]+)?)", line)
+                    if m:
+                        val = parse_number(m.group(1))
+                        if val is not None:
+                            lo, hi = ranges.get(key, (None, None))
+                            if lo is None or (lo <= val <= hi):
+                                return val
+        
+        # 기존 fallback 로직 (위에서 못 찾은 경우)
         for line in window_lines:
             # (체중/지방)조절, Control 등은 측정치가 아닌 참고용 수치(범위 등)일 가능성이 높음
             if re.search(r"(Flue|Fluid|Control|조절|적정체중|표준체중)", line, re.IGNORECASE):
