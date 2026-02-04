@@ -25,8 +25,8 @@ from app.models import Record, InBodyRecord, User, UserProfile, UserGoal, DailyA
 from app.goal_rules import estimate_target_calorie, normalize_activity_level, ACTIVITY_FACTORS, infer_goal_type
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from supabase import create_client, Client
-from openai import OpenAI
 import requests
+from app.meal_plan_ai import MealPlanItem, DayMealPlan, OneDayMealPlan, generate_one_day_plan
 
 # Supabase 클라이언트 초기화
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -40,11 +40,6 @@ security = HTTPBearer()
 
 UPLOAD_DIR = Path("uploads/foods")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY 환경변수가 필요합니다.")
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 # PEXELS_API_KEY 환경변수에 발급받은 키를 설정하세요.
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
@@ -114,6 +109,7 @@ class AuthResponse(BaseModel):
     id: str
     username: str
     message: str
+    has_inbody: Optional[bool] = None
 
 
 class UserGoalResponse(BaseModel):
@@ -173,37 +169,6 @@ class DietPlan3DaysRequest(BaseModel):
     target_calorie: Optional[float] = None
 
 
-class MealPlanItem(BaseModel):
-    name: str
-    description: Optional[str] = None
-    calories_kcal: int
-    carbs_g: float
-    protein_g: float
-    fat_g: float
-    image_url: Optional[str] = None
-
-
-class DayMealPlan(BaseModel):
-    day_label: str
-    date: Optional[str] = None
-    breakfast: MealPlanItem
-    lunch: MealPlanItem
-    dinner: MealPlanItem
-    total_calories_kcal: int
-    total_carbs_g: float
-    total_protein_g: float
-    total_fat_g: float
-
-
-class OneDayMealPlan(BaseModel):
-    goal_type: str
-    target_calorie: Optional[int] = None
-    body_type_stage1: Optional[str] = None
-    body_type_stage2: Optional[str] = None
-    notes: List[str]
-    days: List[DayMealPlan]
-
-
 class PlanMealRecordIn(BaseModel):
     meal_type: str
     name: str
@@ -232,6 +197,11 @@ class TodayIntakeResponse(BaseModel):
     total_protein_g: float
     total_fat_g: float
     plan_date: Optional[str] = None
+
+
+class DietPlanWithIntakeResponse(BaseModel):
+    plan: OneDayMealPlan
+    today_intake: TodayIntakeResponse
 
 
 class CalendarMarkedDatesResponse(BaseModel):
@@ -579,6 +549,8 @@ class SocialCheckResponse(BaseModel):
     email: Optional[str] = None
     provider_user_id: Optional[str] = None
     suggested_username: Optional[str] = None
+    has_inbody: Optional[bool] = None
+    next_path: Optional[str] = None
 
 class SocialRegisterRequest(BaseModel):
     access_token: str
@@ -655,6 +627,13 @@ def check_social_user(payload: SocialCheckRequest, db: Session = Depends(get_db)
     existing_user = db.query(User).filter(User.provider_user_id == user_data.id).first()
 
     if existing_user:
+        latest_inbody = (
+            db.query(InBodyRecord)
+            .filter(InBodyRecord.user_number == existing_user.user_number)
+            .order_by(InBodyRecord.created_at.desc())
+            .first()
+        )
+        has_inbody = bool(latest_inbody)
         return {
             "registered": True,
             "user_number": existing_user.user_number,
@@ -662,6 +641,8 @@ def check_social_user(payload: SocialCheckRequest, db: Session = Depends(get_db)
             "username": existing_user.username,
             "message": "로그인 성공",
             "suggested_username": suggested_username,
+            "has_inbody": has_inbody,
+            "next_path": "/" if has_inbody else "/inbody",
         }
 
     # 3. 가입 안되어 있으면 프론트에서 social-register 호출
@@ -737,6 +718,8 @@ def register_social_user(payload: SocialRegisterRequest, db: Session = Depends(g
             "id": new_user.id,
             "username": new_user.username,
             "message": "회원가입 완료",
+            "has_inbody": False,
+            "next_path": "/inbody",
         }
 
     except Exception as e:
@@ -744,15 +727,26 @@ def register_social_user(payload: SocialRegisterRequest, db: Session = Depends(g
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/api/me", response_model=AuthResponse)
-def read_users_me(current_user: User = Depends(get_current_user_from_token)):
+def read_users_me(
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
     """
     현재 로그인된(토큰) 사용자 정보 조회
     """
+    has_inbody = (
+        db.query(InBodyRecord)
+        .filter(InBodyRecord.user_number == current_user.user_number)
+        .order_by(InBodyRecord.created_at.desc())
+        .first()
+        is not None
+    )
     return {
         "user_number": current_user.user_number,
         "id": current_user.id,
         "username": current_user.username,
-        "message": "사용자 정보를 성공적으로 불러왔습니다."
+        "message": "사용자 정보를 성공적으로 불러왔습니다.",
+        "has_inbody": has_inbody,
     }
 
 
@@ -861,6 +855,52 @@ def upsert_user_goal(
 
     if profile:
         profile.goal_type = goal_type
+
+    prompt = {
+        "goal_type": goal_type,
+        "target_calorie": round(float(target_calorie)) if target_calorie else None,
+        "body_type_stage1": None,
+        "body_type_stage2": None,
+        "latest_inbody": {
+            "height_cm": latest_inbody.height if latest_inbody else None,
+            "weight_kg": latest_inbody.weight if latest_inbody else None,
+            "body_fat_pct": latest_inbody.body_fat_pct if latest_inbody else None,
+            "skeletal_muscle_kg": latest_inbody.skeletal_muscle_mass if latest_inbody else None,
+            "bmr_kcal": latest_inbody.bmr if latest_inbody else None,
+        },
+        "activity_level": normalize_activity_level(profile.activity_level) if profile else None,
+        "notes": [
+            "한국어로만 작성한다.",
+            "1일치(1일) 식단을 제공한다.",
+            "각 일자는 아침/점심/저녁으로 구성한다.",
+            "일일 총칼로리는 목표 칼로리 ±5% 범위를 지향한다.",
+            "식단 이름은 한국어로 자연스럽고 구체적으로 작성한다.",
+            "영양값은 추정치이며 현실적인 범위로 작성한다.",
+            "요즘 한국에서 많이 먹는 대중적이고 익숙한 메뉴 위주로 구성한다.",
+            "지나치게 방대한 메뉴 구성을 피하고 현실적으로 준비 가능한 수준으로 제안한다.",
+        ],
+    }
+
+    try:
+        plan = generate_one_day_plan(prompt)
+    except Exception:
+        raise HTTPException(status_code=500, detail="식단 생성 결과가 올바르지 않습니다.")
+
+    # 음식 이미지 URL 붙이기 (Pexels)
+    for day in plan.days:
+        for meal in (day.breakfast, day.lunch, day.dinner):
+            if not meal.image_url:
+                meal.image_url = _fetch_pexels_image(meal.name)
+
+    db.add(
+        UserDietPlan(
+            user_number=user.user_number,
+            goal_type=goal_type,
+            target_calorie=target_calorie,
+            plan_json=json.dumps(plan.model_dump(), ensure_ascii=False),
+        )
+    )
+
     db.commit()
     return {
         "goal_id": goal.goal_id,
@@ -877,7 +917,7 @@ def upsert_user_goal(
     }
 
 
-@app.post("/api/diet-plan", response_model=OneDayMealPlan)
+@app.post("/api/diet-plan", response_model=DietPlanWithIntakeResponse)
 def generate_1day_diet_plan(
     payload: DietPlan3DaysRequest,
     current_user: User = Depends(get_current_user_from_token),
@@ -992,31 +1032,9 @@ def generate_1day_diet_plan(
         ],
     }
 
-    resp = openai_client.responses.parse(
-        model="gpt-4.1-mini",
-        temperature=0.2,
-        input=[
-            {
-                "role": "system",
-                "content": (
-                    "너는 한국어로만 답하는 식단 코치다. "
-                    "반드시 지정된 JSON 스키마만 출력한다."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    "다음 정보를 바탕으로 1일치 식단을 추천해줘. "
-                    "지정된 JSON 스키마만 출력해.\n"
-                    f"{json.dumps(prompt, ensure_ascii=False)}"
-                ),
-            },
-        ],
-        text_format=OneDayMealPlan,
-    )
-
-    plan: OneDayMealPlan = resp.output_parsed
-    if not plan or len(plan.days) != 1:
+    try:
+        plan = generate_one_day_plan(prompt)
+    except Exception:
         raise HTTPException(status_code=500, detail="식단 생성 결과가 올바르지 않습니다.")
 
     # 음식 이미지 URL 붙이기 (Pexels)
@@ -1034,7 +1052,21 @@ def generate_1day_diet_plan(
     db.add(record)
     db.commit()
 
-    return plan
+    day0 = plan.days[0]
+    today_intake = TodayIntakeResponse(
+        goal_type=plan.goal_type,
+        target_calorie=plan.target_calorie,
+        total_calories_kcal=int(day0.total_calories_kcal),
+        total_carbs_g=float(day0.total_carbs_g),
+        total_protein_g=float(day0.total_protein_g),
+        total_fat_g=float(day0.total_fat_g),
+        plan_date=day0.date,
+    )
+
+    return {
+        "plan": plan,
+        "today_intake": today_intake,
+    }
 
 
 @app.post("/api/diet-plan/places", response_model=DietPlanPlacesResponse)
@@ -1147,7 +1179,7 @@ def create_records_from_plan(
             food_carb=float(meal.carbs_g),
             food_fat=float(meal.fat_g),
             meal_type=meal_type,
-            record_created_at=datetime.combine(record_day, dt_time(12, 0, 0)),
+            record_created_at=datetime.combine(record_day, time(12, 0, 0)),
         )
         db.add(rec)
         db.flush()
@@ -1777,34 +1809,6 @@ def delete_record(
     db.commit()
 
     return {"record_id": record_id, "message": "식단 기록이 삭제되었습니다."}
-
-@app.delete("/api/record", status_code=204)
-def delete_day_records(
-    date: str = Query(..., description="YYYY-MM-DD"),
-    current_user: User = Depends(get_current_user_from_token),
-    db: Session = Depends(get_db),
-):
-    """
-    특정 날짜의 식단 기록 전체 삭제
-    - date: "YYYY-MM-DD"
-    """
-    try:
-        day = datetime.strptime(date, "%Y-%m-%d")
-    except ValueError:
-        raise HTTPException(status_code=400, detail="date는 YYYY-MM-DD 형식이어야 합니다.")
-
-    start = day
-    end = day + timedelta(days=1)
-
-    db.query(Record).filter(
-        Record.user_number == current_user.user_number,
-        Record.record_created_at >= start,
-        Record.record_created_at < end,
-    ).delete(synchronize_session=False)
-
-    db.commit()
-    return
-
 
 @app.post("/api/vision/food")
 async def vision_food(
