@@ -7,9 +7,9 @@ import time as time_module
 from datetime import date, datetime, timezone, time, timedelta
 from pathlib import Path
 from uuid import uuid4
-from sqlalchemy import and_
+from sqlalchemy import and_, func
 from fastapi.responses import RedirectResponse
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, status
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, status, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -50,6 +50,10 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY)
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 PEXELS_API_URL = "https://api.pexels.com/v1/search"
 _pexels_cache: dict[str, Optional[str]] = {}
+
+KAKAO_REST_API_KEY = os.getenv("KAKAO_REST_API_KEY")
+KAKAO_LOCAL_CATEGORY_API_URL = "https://dapi.kakao.com/v2/local/search/category.json"
+KAKAO_LOCAL_KEYWORD_API_URL = "https://dapi.kakao.com/v2/local/search/keyword.json"
 
 # 환경 변수에서 DB 정보 가져오기
 DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -228,6 +232,38 @@ class TodayIntakeResponse(BaseModel):
     total_protein_g: float
     total_fat_g: float
     plan_date: Optional[str] = None
+
+
+class CalendarMarkedDatesResponse(BaseModel):
+    year: int
+    month: int
+    dates: List[str]
+
+
+class DietPlanPlacesRequest(BaseModel):
+    food_name: Optional[str] = None
+    lat: float
+    lng: float
+    radius_m: Optional[int] = 2000
+
+
+class DietPlanPlaceItem(BaseModel):
+    id: str
+    name: str
+    category_group_code: Optional[str] = None
+    category_group_name: Optional[str] = None
+    category_name: Optional[str] = None
+    address_name: Optional[str] = None
+    road_address_name: Optional[str] = None
+    phone: Optional[str] = None
+    place_url: Optional[str] = None
+    distance_m: Optional[int] = None
+    x: float
+    y: float
+
+
+class DietPlanPlacesResponse(BaseModel):
+    places: List[DietPlanPlaceItem]
 
 
 
@@ -410,6 +446,65 @@ def _fetch_pexels_image(query: str) -> Optional[str]:
     except Exception:
         _pexels_cache[key] = None
         return None
+
+
+def _kakao_local_search_category(lat: float, lng: float, radius_m: int, category_code: str) -> List[dict]:
+    if not KAKAO_REST_API_KEY:
+        raise HTTPException(status_code=500, detail="KAKAO_REST_API_KEY 환경변수가 필요합니다.")
+
+    radius = max(10, min(int(radius_m), 20000))
+    try:
+        resp = requests.get(
+            KAKAO_LOCAL_CATEGORY_API_URL,
+            headers={"Authorization": f"KakaoAK {KAKAO_REST_API_KEY}"},
+            params={
+                "category_group_code": category_code,
+                "x": lng,
+                "y": lat,
+                "radius": radius,
+                "sort": "distance",
+                "size": 10,
+            },
+            timeout=5,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("documents") or []
+    except HTTPException:
+        raise
+    except Exception:
+        return []
+
+
+def _kakao_local_search_keyword(lat: float, lng: float, radius_m: int, keyword: str) -> List[dict]:
+    if not KAKAO_REST_API_KEY:
+        raise HTTPException(status_code=500, detail="KAKAO_REST_API_KEY 환경변수가 필요합니다.")
+
+    if not keyword or not keyword.strip():
+        return []
+
+    radius = max(10, min(int(radius_m), 20000))
+    try:
+        resp = requests.get(
+            KAKAO_LOCAL_KEYWORD_API_URL,
+            headers={"Authorization": f"KakaoAK {KAKAO_REST_API_KEY}"},
+            params={
+                "query": keyword.strip(),
+                "x": lng,
+                "y": lat,
+                "radius": radius,
+                "sort": "distance",
+                "size": 10,
+            },
+            timeout=5,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("documents") or []
+    except HTTPException:
+        raise
+    except Exception:
+        return []
 
 async def get_current_user_from_token(
     credentials: HTTPAuthorizationCredentials = Depends(security),
@@ -892,6 +987,8 @@ def generate_1day_diet_plan(
             "일일 총칼로리는 목표 칼로리 ±5% 범위를 지향한다.",
             "식단 이름은 한국어로 자연스럽고 구체적으로 작성한다.",
             "영양값은 추정치이며 현실적인 범위로 작성한다.",
+            "요즘 한국에서 많이 먹는 대중적이고 익숙한 메뉴 위주로 구성한다.",
+            "지나치게 방대한 메뉴 구성을 피하고 현실적으로 준비 가능한 수준으로 제안한다.",
         ],
     }
 
@@ -938,6 +1035,69 @@ def generate_1day_diet_plan(
     db.commit()
 
     return plan
+
+
+@app.post("/api/diet-plan/places", response_model=DietPlanPlacesResponse)
+def get_diet_plan_places(
+    payload: DietPlanPlacesRequest,
+    current_user: User = Depends(get_current_user_from_token),
+):
+    """내 위치 기반 주변 편의점/음식점 10곳 반환"""
+    lat = float(payload.lat)  # 위도 (latitude)
+    lng = float(payload.lng)  # 경도 (longitude)
+    radius_m = payload.radius_m or 2000
+    food_name = (payload.food_name or "").strip()
+
+    categories = ["CS2", "FD6"]  # 편의점, 음식점
+    raw_places: List[dict] = []
+    if food_name:
+        raw_places.extend(_kakao_local_search_keyword(lat, lng, radius_m, food_name))
+    for code in categories:
+        raw_places.extend(_kakao_local_search_category(lat, lng, radius_m, code))
+
+    dedup: dict[str, dict] = {}
+    for item in raw_places:
+        place_id = str(item.get("id"))
+        if not place_id:
+            continue
+        if place_id in dedup:
+            continue
+        dedup[place_id] = item
+
+    def _distance_value(value: Optional[str]) -> int:
+        try:
+            return int(value or 10**9)
+        except Exception:
+            return 10**9
+
+    sorted_items = sorted(dedup.values(), key=lambda x: _distance_value(x.get("distance")))
+    limited = sorted_items[:10]
+
+    places: List[DietPlanPlaceItem] = []
+    for item in limited:
+        try:
+            x = float(item.get("x"))
+            y = float(item.get("y"))
+        except Exception:
+            continue
+        places.append(
+            DietPlanPlaceItem(
+                id=str(item.get("id")),
+                name=item.get("place_name") or "",
+                category_group_code=item.get("category_group_code"),
+                category_group_name=item.get("category_group_name"),
+                category_name=item.get("category_name"),
+                address_name=item.get("address_name"),
+                road_address_name=item.get("road_address_name"),
+                phone=item.get("phone"),
+                place_url=item.get("place_url"),
+                distance_m=_distance_value(item.get("distance")),
+                x=x,
+                y=y,
+            )
+        )
+
+    return DietPlanPlacesResponse(places=places)
 
 
 @app.post("/api/plan/record", response_model=PlanRecordCreateResult)
@@ -1533,6 +1693,46 @@ def get_record(
     ]
 
 
+@app.get("/api/calendar", response_model=CalendarMarkedDatesResponse)
+def get_calendar_marked_dates(
+    year: int,
+    month: int,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    """
+    사용자가 기록한 날짜 목록 반환 (캘린더 표시용)
+    - year: 4자리 연도
+    - month: 1~12
+    """
+    if month < 1 or month > 12:
+        raise HTTPException(status_code=400, detail="month는 1~12 범위여야 합니다.")
+
+    start_date = date(year, month, 1)
+    if month == 12:
+        end_date = date(year + 1, 1, 1)
+    else:
+        end_date = date(year, month + 1, 1)
+
+    dates = (
+        db.query(func.date(Record.record_created_at))
+        .filter(
+            Record.user_number == current_user.user_number,
+            Record.record_created_at >= start_date,
+            Record.record_created_at < end_date,
+        )
+        .distinct()
+        .order_by(func.date(Record.record_created_at))
+        .all()
+    )
+
+    return {
+        "year": year,
+        "month": month,
+        "dates": [d[0].isoformat() for d in dates if d and d[0]],
+    }
+
+
 @app.delete("/api/record/{record_id}", response_model=RecordDeleteResponse)
 def delete_record(
     record_id: int,
@@ -1552,6 +1752,34 @@ def delete_record(
     db.commit()
 
     return {"record_id": record_id, "message": "식단 기록이 삭제되었습니다."}
+
+@app.delete("/api/record", status_code=204)
+def delete_day_records(
+    date: str = Query(..., description="YYYY-MM-DD"),
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    """
+    특정 날짜의 식단 기록 전체 삭제
+    - date: "YYYY-MM-DD"
+    """
+    try:
+        day = datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="date는 YYYY-MM-DD 형식이어야 합니다.")
+
+    start = day
+    end = day + timedelta(days=1)
+
+    db.query(Record).filter(
+        Record.user_number == current_user.user_number,
+        Record.record_created_at >= start,
+        Record.record_created_at < end,
+    ).delete(synchronize_session=False)
+
+    db.commit()
+    return
+
 
 @app.post("/api/vision/food")
 async def vision_food(
