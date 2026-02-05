@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 from PIL import Image
 from app.database import SessionLocal
 from app.models import User, UserProfile, InBodyRecord, BMIHistory, UserGoal, UserDietPlan
-from app.inbody import InbodyInput, classify_body_type
+from app.inbody import InbodyInput, classify_body_type, thresholds
 from app.goal_rules import infer_goal_type, estimate_target_calorie, normalize_activity_level
 from app.meal_plan_ai import generate_one_day_plan
 
@@ -557,7 +557,15 @@ def update_user_inbody(user_number: int, values: dict) -> None:
             new_record.predicted_classify = None
             new_record.classify_name = result.stage2
 
-            goal_type = infer_goal_type(result.stage1, result.stage2)
+            ffmi = result.metrics.get("ffmi") if result.metrics else None
+            th = thresholds(gender) if gender else None
+            goal_type = infer_goal_type(
+                result.stage1,
+                result.stage2,
+                ffmi=ffmi,
+                ffmi_low=(th.get("ffmi_low") if th else None),
+                ffmi_muscular=(th.get("ffmi_muscular") if th else None),
+            )
             target_calorie = estimate_target_calorie(
                 goal_type=goal_type,
                 bmr_kcal=new_record.bmr,

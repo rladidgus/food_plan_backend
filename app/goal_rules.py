@@ -30,11 +30,20 @@ def normalize_activity_level(level: Optional[str]) -> Optional[str]:
     return alias.get(value, value)
 
 
-def infer_goal_type(stage1: str, stage2: str) -> str:
+def infer_goal_type(
+    stage1: str,
+    stage2: str,
+    ffmi: Optional[float] = None,
+    ffmi_low: Optional[float] = None,
+    ffmi_muscular: Optional[float] = None,
+) -> str:
     """룰 기반 목표 타입(diet/maintain/bulk) 결정."""
     if stage2 in {"마른비만", "근감소성비만", "비만(지방형)", "근육형비만"}:
         return "diet"
     if stage2 in {"초저체중(위험)", "표준저근육"}:
+        return "bulk"
+
+    if ffmi is not None and ffmi_low is not None and ffmi < ffmi_low:
         return "bulk"
 
     if stage1 == "마름":
