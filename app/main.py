@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from app.food_lens import decide_food_gpt_only
 from app.database import get_db, engine, Base
-from app.inbody import InbodyInput, BodyTypeResult, classify_body_type
+from app.inbody import InbodyInput, BodyTypeResult, classify_body_type, thresholds
 from app.models import Record, InBodyRecord, User, UserProfile, FoodAnalysisResult
 from typing import List, Optional
 from app import models
@@ -197,6 +197,12 @@ class TodayIntakeResponse(BaseModel):
     total_protein_g: float
     total_fat_g: float
     plan_date: Optional[str] = None
+
+
+class UserGoalWithPlanResponse(UserGoalResponse):
+    """사용자 목표 변경 응답 (목표 + 최신 식단)"""
+    plan: Optional[OneDayMealPlan] = None
+    today_intake: Optional[TodayIntakeResponse] = None
 
 
 class DietPlanWithIntakeResponse(BaseModel):
@@ -797,7 +803,7 @@ def get_user_goal(
     }
 
 
-@app.post("/api/user/goal", response_model=UserGoalResponse)
+@app.post("/api/user/goal", response_model=UserGoalWithPlanResponse)
 def upsert_user_goal(
     payload: UserGoalUpdateRequest,
     current_user: User = Depends(get_current_user_from_token),
@@ -902,6 +908,17 @@ def upsert_user_goal(
     )
 
     db.commit()
+
+    day0 = plan.days[0]
+    today_intake = TodayIntakeResponse(
+        goal_type=plan.goal_type,
+        target_calorie=plan.target_calorie,
+        total_calories_kcal=int(day0.total_calories_kcal),
+        total_carbs_g=float(day0.total_carbs_g),
+        total_protein_g=float(day0.total_protein_g),
+        total_fat_g=float(day0.total_fat_g),
+        plan_date=day0.date,
+    )
     return {
         "goal_id": goal.goal_id,
         "goal_type": goal.goal_type,
@@ -914,6 +931,8 @@ def upsert_user_goal(
         "start_date": goal.start_date.isoformat() if goal.start_date else None,
         "end_date": goal.end_date.isoformat() if goal.end_date else None,
         "created_at": goal.created_at.isoformat() if goal.created_at else None,
+        "plan": plan,
+        "today_intake": today_intake,
     }
 
 
@@ -942,6 +961,9 @@ def generate_1day_diet_plan(
 
     body_stage1 = None
     body_stage2 = None
+    body_ffmi = None
+    ffmi_low = None
+    ffmi_muscular = None
     gender_raw = (profile.gender if profile else None)
     gender = None
     if gender_raw:
@@ -971,6 +993,10 @@ def generate_1day_diet_plan(
         body_result = classify_body_type(inbody_input)
         body_stage1 = body_result.stage1
         body_stage2 = body_result.stage2
+        body_ffmi = body_result.metrics.get("ffmi") if body_result.metrics else None
+        th = thresholds(gender)
+        ffmi_low = th.get("ffmi_low")
+        ffmi_muscular = th.get("ffmi_muscular")
 
     goal_type = _normalize_goal_type(payload.goal_type)
     if goal_type and goal_type not in {"diet", "maintain", "bulk"}:
@@ -987,7 +1013,13 @@ def generate_1day_diet_plan(
     )
     if goal_type is None:
         if body_stage1 or body_stage2:
-            goal_type = infer_goal_type(body_stage1 or "", body_stage2 or "")
+            goal_type = infer_goal_type(
+                body_stage1 or "",
+                body_stage2 or "",
+                ffmi=body_ffmi,
+                ffmi_low=ffmi_low,
+                ffmi_muscular=ffmi_muscular,
+            )
         elif latest_goal and latest_goal.goal_type:
             goal_type = _normalize_goal_type(latest_goal.goal_type)
         elif profile and profile.goal_type:
@@ -1783,6 +1815,32 @@ def delete_record(
     db.commit()
 
     return {"record_id": record_id, "message": "식단 기록이 삭제되었습니다."}
+@app.delete("/api/record", status_code=204)
+def delete_day_records(
+    date: str = Query(..., description="YYYY-MM-DD"),
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    """
+    특정 날짜의 식단 기록 전체 삭제
+    - date: "YYYY-MM-DD"
+    """
+    try:
+        day = datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="date는 YYYY-MM-DD 형식이어야 합니다.")
+
+    start = day
+    end = day + timedelta(days=1)
+
+    db.query(Record).filter(
+        Record.user_number == current_user.user_number,
+        Record.record_created_at >= start,
+        Record.record_created_at < end,
+    ).delete(synchronize_session=False)
+
+    db.commit()
+    return
 
 @app.post("/api/vision/food")
 async def vision_food(
