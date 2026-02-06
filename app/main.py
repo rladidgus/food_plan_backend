@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from app.food_lens import decide_food_gpt_only
 from app.database import get_db, engine, Base
-from app.inbody import InbodyInput, BodyTypeResult, classify_body_type, thresholds
+from app.inbody import InbodyInput, BodyTypeResult, classify_body_type
 from app.models import Record, InBodyRecord, User, UserProfile, FoodAnalysisResult
 from typing import List, Optional
 from app import models
@@ -59,6 +59,8 @@ DB_PASS = os.getenv("DB_PASS", "password")
 # FastAPI 앱 생성
 app = FastAPI(title="식단 계획 AI API")
 logger = logging.getLogger("app.sync")
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
@@ -576,6 +578,17 @@ def _fallback_user_id(provider_user_id: Optional[str], email: Optional[str]) -> 
         return f"supabase:{provider_user_id}"
     return uuid4().hex
 
+
+def _log_access_token(token: str) -> None:
+    if os.getenv("LOG_FULL_TOKEN") == "1":
+        logger.info("access_token=%s", token)
+        return
+    if not token:
+        logger.info("access_token=EMPTY")
+        return
+    prefix = token[:8]
+    logger.info("access_token_prefix=%s...", prefix)
+
 @app.get("/api/auth/oauth/url")
 def get_oauth_url(provider: str = "google"):
     """
@@ -611,6 +624,7 @@ def check_social_user(payload: SocialCheckRequest, db: Session = Depends(get_db)
     - 가입 안되어 있으면: registered=False 반환
     """
     try:
+        _log_access_token(payload.access_token)
         # 1. 토큰 검증
         user_response = supabase.auth.get_user(payload.access_token)
         user_data = user_response.user
@@ -631,6 +645,17 @@ def check_social_user(payload: SocialCheckRequest, db: Session = Depends(get_db)
 
     # 2. DB 조회
     existing_user = db.query(User).filter(User.provider_user_id == user_data.id).first()
+    if not existing_user and email:
+        existing_user = (
+            db.query(User)
+            .filter((User.email == email) | (User.id == email))
+            .first()
+        )
+        # 기존 계정에 소셜 아이디가 비어 있으면 연결
+        if existing_user and not existing_user.provider_user_id:
+            existing_user.provider_user_id = user_data.id
+            db.commit()
+            db.refresh(existing_user)
 
     if existing_user:
         latest_inbody = (
@@ -666,6 +691,7 @@ def register_social_user(payload: SocialRegisterRequest, db: Session = Depends(g
     소셜 로그인 후 추가 정보를 입력받아 회원가입 완료
     """
     try:
+        _log_access_token(payload.access_token)
         # 1) 토큰 검증 (supabase-py 공식 사용 패턴 유지)
         user_response = supabase.auth.get_user(payload.access_token)
         user_data = user_response.user
@@ -675,8 +701,14 @@ def register_social_user(payload: SocialRegisterRequest, db: Session = Depends(g
         provider_user_id = user_data.id
         email = user_data.email
 
-        # 2) 중복 확인
+        # 2) 중복 확인 (provider_user_id, email/id)
         exists = db.query(User).filter(User.provider_user_id == provider_user_id).first()
+        if not exists and email:
+            exists = (
+                db.query(User)
+                .filter((User.email == email) | (User.id == email))
+                .first()
+            )
         if exists:
             raise HTTPException(status_code=400, detail="이미 가입된 사용자입니다.")
 
@@ -780,6 +812,15 @@ def get_user_goal(
     db: Session = Depends(get_db),
 ):
     """사용자 목표 조회"""
+    latest_inbody = (
+        db.query(InBodyRecord)
+        .filter(InBodyRecord.user_number == current_user.user_number)
+        .order_by(InBodyRecord.created_at.desc())
+        .first()
+    )
+    if not latest_inbody:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="인바디 기록이 없습니다.")
+
     goal = (
         db.query(UserGoal)
         .filter(UserGoal.user_number == current_user.user_number)
@@ -889,8 +930,11 @@ def upsert_user_goal(
 
     try:
         plan = generate_one_day_plan(prompt)
-    except Exception:
-        raise HTTPException(status_code=500, detail="식단 생성 결과가 올바르지 않습니다.")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"식단 생성 결과가 올바르지 않습니다. error={type(exc).__name__}: {exc}",
+        )
 
     # 음식 이미지 URL 붙이기 (Pexels)
     for day in plan.days:
@@ -961,9 +1005,6 @@ def generate_1day_diet_plan(
 
     body_stage1 = None
     body_stage2 = None
-    body_ffmi = None
-    ffmi_low = None
-    ffmi_muscular = None
     gender_raw = (profile.gender if profile else None)
     gender = None
     if gender_raw:
@@ -993,10 +1034,6 @@ def generate_1day_diet_plan(
         body_result = classify_body_type(inbody_input)
         body_stage1 = body_result.stage1
         body_stage2 = body_result.stage2
-        body_ffmi = body_result.metrics.get("ffmi") if body_result.metrics else None
-        th = thresholds(gender)
-        ffmi_low = th.get("ffmi_low")
-        ffmi_muscular = th.get("ffmi_muscular")
 
     goal_type = _normalize_goal_type(payload.goal_type)
     if goal_type and goal_type not in {"diet", "maintain", "bulk"}:
@@ -1013,13 +1050,7 @@ def generate_1day_diet_plan(
     )
     if goal_type is None:
         if body_stage1 or body_stage2:
-            goal_type = infer_goal_type(
-                body_stage1 or "",
-                body_stage2 or "",
-                ffmi=body_ffmi,
-                ffmi_low=ffmi_low,
-                ffmi_muscular=ffmi_muscular,
-            )
+            goal_type = infer_goal_type(body_stage1 or "", body_stage2 or "")
         elif latest_goal and latest_goal.goal_type:
             goal_type = _normalize_goal_type(latest_goal.goal_type)
         elif profile and profile.goal_type:
@@ -1066,8 +1097,11 @@ def generate_1day_diet_plan(
 
     try:
         plan = generate_one_day_plan(prompt)
-    except Exception:
-        raise HTTPException(status_code=500, detail="식단 생성 결과가 올바르지 않습니다.")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"식단 생성 결과가 올바르지 않습니다. error={type(exc).__name__}: {exc}",
+        )
 
     # 음식 이미지 URL 붙이기 (Pexels)
     for day in plan.days:
@@ -1318,6 +1352,101 @@ def get_latest_inbody(
         },
         "created_at": record.created_at.isoformat()
     }
+
+
+@app.delete("/api/inbody-latest")
+def delete_latest_inbody(
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    """사용자 최신 인바디 기록 1건 삭제"""
+    record = (
+        db.query(InBodyRecord)
+        .filter(InBodyRecord.user_number == current_user.user_number)
+        .order_by(InBodyRecord.created_at.desc())
+        .first()
+    )
+    if not record:
+        raise HTTPException(status_code=404, detail="삭제할 인바디 기록이 없습니다.")
+
+    deleted_id = record.inbody_id
+    db.delete(record)
+    db.commit()
+
+    latest = (
+        db.query(InBodyRecord)
+        .filter(InBodyRecord.user_number == current_user.user_number)
+        .order_by(InBodyRecord.created_at.desc())
+        .first()
+    )
+
+    profile = (
+        db.query(UserProfile)
+        .filter(UserProfile.user_number == current_user.user_number)
+        .one_or_none()
+    )
+    if profile:
+        if latest:
+            profile.height = latest.height
+            profile.weight = latest.weight
+            profile.body_fat_percent = latest.body_fat_pct
+            profile.skeletal_muscle_mass = latest.skeletal_muscle_mass
+            profile.bmr = latest.bmr
+        else:
+            profile.height = None
+            profile.weight = None
+            profile.body_fat_percent = None
+            profile.skeletal_muscle_mass = None
+            profile.bmr = None
+            profile.goal_type = None
+        db.add(profile)
+
+    # 인바디 삭제 시 목표/식단도 최신 1건만 삭제
+    latest_goal = (
+        db.query(UserGoal)
+        .filter(UserGoal.user_number == current_user.user_number)
+        .order_by(UserGoal.created_at.desc())
+        .first()
+    )
+    if latest_goal:
+        db.delete(latest_goal)
+
+    latest_plan = (
+        db.query(UserDietPlan)
+        .filter(UserDietPlan.user_number == current_user.user_number)
+        .order_by(UserDietPlan.created_at.desc())
+        .first()
+    )
+    if latest_plan:
+        db.delete(latest_plan)
+    db.commit()
+
+    latest_payload = None
+    if latest:
+        latest_payload = {
+            "inbody_id": latest.inbody_id,
+            "measurement_date": latest.measurement_date.isoformat() if latest.measurement_date else None,
+            "height": latest.height,
+            "weight": latest.weight,
+            "body_fat_pct": latest.body_fat_pct,
+            "skeletal_muscle_mass": latest.skeletal_muscle_mass,
+            "predicted_classify": latest.predicted_classify,
+            "classify_name": latest.classify_name,
+            "values": {
+                k: v for k, v in {
+                    "height": latest.height,
+                    "weight": latest.weight,
+                    "body_fat_mass": latest.body_fat_mass,
+                    "body_fat_pct": latest.body_fat_pct,
+                    "skeletal_muscle_mass": latest.skeletal_muscle_mass,
+                    "bmr": latest.bmr,
+                    "inbody_score": latest.inbody_score,
+                }.items() if v is not None
+            },
+            "created_at": latest.created_at.isoformat()
+        }
+
+    return {"deleted": True, "inbody_id": deleted_id, "latest_inbody": latest_payload}
 
 
 @app.get("/api/mypage", response_model=MyPageEnvelopeResponse)
@@ -1794,27 +1923,7 @@ def get_calendar_marked_dates(
         "month": month,
         "dates": [d[0].isoformat() for d in dates if d and d[0]],
     }
-
-
-@app.delete("/api/record/{record_id}", response_model=RecordDeleteResponse)
-def delete_record(
-    record_id: int,
-    current_user: User = Depends(get_current_user_from_token),
-    db: Session = Depends(get_db),
-):
-    """식단 기록 삭제"""
-    record = (
-        db.query(Record)
-        .filter(Record.record_id == record_id, Record.user_number == current_user.user_number)
-        .first()
-    )
-    if not record:
-        raise HTTPException(status_code=404, detail="식단 기록을 찾을 수 없습니다.")
-
-    db.delete(record)
-    db.commit()
-
-    return {"record_id": record_id, "message": "식단 기록이 삭제되었습니다."}
+    
 @app.delete("/api/record", status_code=204)
 def delete_day_records(
     date: str = Query(..., description="YYYY-MM-DD"),
@@ -1841,6 +1950,28 @@ def delete_day_records(
 
     db.commit()
     return
+    
+
+
+@app.delete("/api/record/{record_id}", response_model=RecordDeleteResponse)
+def delete_record(
+    record_id: int,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    """식단 기록 삭제"""
+    record = (
+        db.query(Record)
+        .filter(Record.record_id == record_id, Record.user_number == current_user.user_number)
+        .first()
+    )
+    if not record:
+        raise HTTPException(status_code=404, detail="식단 기록을 찾을 수 없습니다.")
+
+    db.delete(record)
+    db.commit()
+
+    return {"record_id": record_id, "message": "식단 기록이 삭제되었습니다."}
 
 @app.post("/api/vision/food")
 async def vision_food(
