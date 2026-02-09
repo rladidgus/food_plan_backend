@@ -4,6 +4,7 @@ import traceback
 import time
 import logging
 import time as time_module
+import re
 from datetime import date, datetime, timezone, time, timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -27,6 +28,14 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from supabase import create_client, Client
 import requests
 from app.meal_plan_ai import MealPlanItem, DayMealPlan, OneDayMealPlan, generate_one_day_plan
+from app.vector_store import (
+    upsert_meal_record,
+    delete_meal_record,
+    delete_meal_records_bulk,
+    search_user_preferred_meals,
+    get_collection,
+    migrate_existing_records,
+)
 
 # Supabase 클라이언트 초기화
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -168,6 +177,12 @@ class DietPlan3DaysRequest(BaseModel):
     user_number: Optional[int] = None
     id: Optional[str] = None
     goal_type: Optional[str] = None
+    target_calorie: Optional[float] = None
+
+
+class DietPlanContextRequest(BaseModel):
+    """상황 기반 식단 추천 요청"""
+    context: str
     target_calorie: Optional[float] = None
 
 
@@ -345,11 +360,32 @@ class BodyTypeFromUserRequest(BaseModel):
 # DB 테이블 생성
 @app.on_event("startup")
 def startup_event():
-    """애플리케이션 시작 시 DB 테이블 생성"""
+    """애플리케이션 시작 시 DB 테이블 생성 & ChromaDB 초기화"""
     print("🚀 FastAPI 서버 시작 중...")
     time_module.sleep(3)  # DB가 준비될 때까지 대기
     Base.metadata.create_all(bind=engine)
     print("✅ 데이터베이스 초기화 완료")
+
+    # ChromaDB 초기화
+    try:
+        collection = get_collection()
+        count = collection.count()
+        print(f"✅ ChromaDB 초기화 완료 (벡터 수: {count})")
+
+        # 기존 record 데이터가 있는데 ChromaDB가 비어있으면 마이그레이션
+        if count == 0:
+            from app.database import SessionLocal
+            db = SessionLocal()
+            try:
+                record_count = db.query(models.Record).count()
+                if record_count > 0:
+                    print(f"📦 기존 식단 기록 {record_count}건을 ChromaDB로 마이그레이션 중...")
+                    migrated = migrate_existing_records(db)
+                    print(f"✅ ChromaDB 마이그레이션 완료: {migrated}건")
+            finally:
+                db.close()
+    except Exception as e:
+        print(f"⚠️ ChromaDB 초기화 실패 (서버는 계속 실행됩니다): {e}")
 
 @app.get("/")
 def root():
@@ -445,13 +481,31 @@ def _kakao_local_search_category(lat: float, lng: float, radius_m: int, category
             },
             timeout=5,
         )
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            logger.warning(
+                "Kakao category search failed: status=%s, body=%s",
+                resp.status_code,
+                (resp.text or "")[:500],
+            )
+            raise HTTPException(status_code=502, detail="Kakao Local API 오류(카테고리 검색)")
         data = resp.json()
-        return data.get("documents") or []
+        docs = data.get("documents") or []
+        if not docs:
+            meta = data.get("meta") or {}
+            logger.info(
+                "Kakao category empty: code=%s, radius=%s, lat=%s, lng=%s, total=%s",
+                category_code,
+                radius,
+                lat,
+                lng,
+                meta.get("total_count"),
+            )
+        return docs
     except HTTPException:
         raise
-    except Exception:
-        return []
+    except Exception as e:
+        logger.exception("Kakao category search exception: %s", e)
+        raise HTTPException(status_code=502, detail="Kakao Local API 요청 실패(카테고리 검색)")
 
 
 def _kakao_local_search_keyword(lat: float, lng: float, radius_m: int, keyword: str) -> List[dict]:
@@ -476,13 +530,83 @@ def _kakao_local_search_keyword(lat: float, lng: float, radius_m: int, keyword: 
             },
             timeout=5,
         )
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            logger.warning(
+                "Kakao keyword search failed: status=%s, body=%s",
+                resp.status_code,
+                (resp.text or "")[:500],
+            )
+            raise HTTPException(status_code=502, detail="Kakao Local API 오류(키워드 검색)")
         data = resp.json()
-        return data.get("documents") or []
+        docs = data.get("documents") or []
+        if not docs:
+            meta = data.get("meta") or {}
+            logger.info(
+                "Kakao keyword empty: keyword=%s, radius=%s, lat=%s, lng=%s, total=%s",
+                keyword.strip(),
+                radius,
+                lat,
+                lng,
+                meta.get("total_count"),
+            )
+        return docs
     except HTTPException:
         raise
-    except Exception:
+    except Exception as e:
+        logger.exception("Kakao keyword search exception: %s", e)
+        raise HTTPException(status_code=502, detail="Kakao Local API 요청 실패(키워드 검색)")
+
+
+def _extract_food_tokens(food_name: str) -> List[str]:
+    tokens = [t for t in re.split(r"\s+", (food_name or "").strip()) if len(t) >= 2]
+    return tokens
+
+
+def _build_place_queries(food_name: str) -> List[str]:
+    base = (food_name or "").strip()
+    if not base:
         return []
+    tokens = _extract_food_tokens(base)
+    queries = [
+        base,
+        f"{base} 전문점",
+        f"{base} 맛집",
+        f"{base} 카페",
+    ]
+    if tokens:
+        last = tokens[-1]
+        queries.extend([
+            f"{last} 전문점",
+            f"{last} 맛집",
+        ])
+    # dedup while preserving order
+    seen = set()
+    result: List[str] = []
+    for q in queries:
+        qn = q.strip()
+        if not qn or qn in seen:
+            continue
+        seen.add(qn)
+        result.append(qn)
+    return result[:8]
+
+
+def _place_score(item: dict, tokens: List[str], queries: List[str]) -> int:
+    name = (item.get("place_name") or "").lower()
+    cat = (item.get("category_name") or "").lower()
+    score = 0
+    for t in tokens:
+        tl = t.lower()
+        if tl in name:
+            score += 6
+        if tl in cat:
+            score += 3
+    for q in queries:
+        ql = q.lower()
+        if ql and ql in name:
+            score += 2
+    return score
+
 
 async def get_current_user_from_token(
     credentials: HTTPAuthorizationCredentials = Depends(security),
@@ -903,6 +1027,17 @@ def upsert_user_goal(
     if profile:
         profile.goal_type = goal_type
 
+    # ChromaDB에서 사용자 선호 음식 검색
+    preferred_meals = []
+    try:
+        preferred_meals = search_user_preferred_meals(
+            user_number=user.user_number,
+            goal_type=goal_type,
+            target_calorie=float(target_calorie) if target_calorie else 2000.0,
+        )
+    except Exception as e:
+        logger.warning("벡터 검색 실패 (무시하고 계속 진행): %s", e)
+
     prompt = {
         "goal_type": goal_type,
         "target_calorie": round(float(target_calorie)) if target_calorie else None,
@@ -929,7 +1064,7 @@ def upsert_user_goal(
     }
 
     try:
-        plan = generate_one_day_plan(prompt)
+        plan = generate_one_day_plan(prompt, preferred_meals=preferred_meals)
     except Exception as exc:
         raise HTTPException(
             status_code=500,
@@ -1070,6 +1205,17 @@ def generate_1day_diet_plan(
                 normalize_activity_level(profile.activity_level) if profile else None,
             )
 
+    # ChromaDB에서 사용자 선호 음식 검색
+    preferred_meals = []
+    try:
+        preferred_meals = search_user_preferred_meals(
+            user_number=user.user_number,
+            goal_type=goal_type,
+            target_calorie=float(target_calorie) if target_calorie else 2000.0,
+        )
+    except Exception as e:
+        logger.warning("벡터 검색 실패 (무시하고 계속 진행): %s", e)
+
     prompt = {
         "goal_type": goal_type,
         "target_calorie": round(float(target_calorie)) if target_calorie else None,
@@ -1096,7 +1242,195 @@ def generate_1day_diet_plan(
     }
 
     try:
-        plan = generate_one_day_plan(prompt)
+        plan = generate_one_day_plan(prompt, preferred_meals=preferred_meals)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"식단 생성 결과가 올바르지 않습니다. error={type(exc).__name__}: {exc}",
+        )
+
+    # 음식 이미지 URL 붙이기 (Pexels)
+    for day in plan.days:
+        for meal in (day.breakfast, day.lunch, day.dinner):
+            if not meal.image_url:
+                meal.image_url = _fetch_pexels_image(meal.name)
+
+    record = UserDietPlan(
+        user_number=user.user_number,
+        goal_type=goal_type,
+        target_calorie=target_calorie,
+        plan_json=json.dumps(plan.model_dump(), ensure_ascii=False),
+    )
+    db.add(record)
+    db.commit()
+
+    day0 = plan.days[0]
+    today_intake = TodayIntakeResponse(
+        goal_type=plan.goal_type,
+        target_calorie=plan.target_calorie,
+        total_calories_kcal=int(day0.total_calories_kcal),
+        total_carbs_g=float(day0.total_carbs_g),
+        total_protein_g=float(day0.total_protein_g),
+        total_fat_g=float(day0.total_fat_g),
+        plan_date=day0.date,
+    )
+
+    return {
+        "plan": plan,
+        "today_intake": today_intake,
+    }
+
+
+@app.post("/api/diet-plan/context", response_model=DietPlanWithIntakeResponse)
+def generate_context_aware_diet_plan(
+    payload: DietPlanContextRequest,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    """상황 기반 1일 식단 추천 (OpenAI + Vector)"""
+    user = current_user
+    context = payload.context
+
+    if not context or not context.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="context는 비어 있을 수 없습니다.",
+        )
+
+    profile = (
+        db.query(UserProfile)
+        .filter(UserProfile.user_number == user.user_number)
+        .first()
+    )
+    latest_inbody = (
+        db.query(InBodyRecord)
+        .filter(InBodyRecord.user_number == user.user_number)
+        .order_by(InBodyRecord.created_at.desc())
+        .first()
+    )
+    if not latest_inbody:
+        raise HTTPException(status_code=404, detail="인바디 기록이 없습니다.")
+
+    body_stage1 = None
+    body_stage2 = None
+    gender_raw = (profile.gender if profile else None)
+    gender = None
+    if gender_raw:
+        value = str(gender_raw).strip().lower()
+        if value in ("m", "male", "남", "남성"):
+            gender = "M"
+        elif value in ("f", "female", "여", "여성"):
+            gender = "F"
+
+    required_fields = {
+        "height": latest_inbody.height,
+        "weight": latest_inbody.weight,
+        "body_fat_mass": latest_inbody.body_fat_mass,
+        "body_fat_pct": latest_inbody.body_fat_pct,
+        "skeletal_muscle_mass": latest_inbody.skeletal_muscle_mass,
+    }
+    if gender and all(value is not None for value in required_fields.values()):
+        inbody_input = InbodyInput(
+            gender=gender,
+            height_cm=latest_inbody.height,
+            weight_kg=latest_inbody.weight,
+            body_fat_kg=latest_inbody.body_fat_mass,
+            body_fat_pct=latest_inbody.body_fat_pct,
+            skeletal_muscle_kg=latest_inbody.skeletal_muscle_mass,
+            bmr_kcal=latest_inbody.bmr,
+        )
+        body_result = classify_body_type(inbody_input)
+        body_stage1 = body_result.stage1
+        body_stage2 = body_result.stage2
+
+    latest_goal = (
+        db.query(UserGoal)
+        .filter(UserGoal.user_number == user.user_number)
+        .order_by(UserGoal.created_at.desc())
+        .first()
+    )
+
+    goal_type = infer_goal_type(body_stage1 or "", body_stage2 or "")
+    if latest_goal and latest_goal.goal_type:
+        goal_type = _normalize_goal_type(latest_goal.goal_type)
+    elif profile and profile.goal_type:
+        goal_type = _normalize_goal_type(profile.goal_type)
+    else:
+        goal_type = "maintain"
+
+    target_calorie = payload.target_calorie
+    if target_calorie is None:
+        if latest_goal and latest_goal.target_calorie is not None:
+            target_calorie = latest_goal.target_calorie
+        else:
+            target_calorie = estimate_target_calorie(
+                goal_type,
+                latest_inbody.bmr,
+                latest_inbody.weight,
+                normalize_activity_level(profile.activity_level) if profile else None,
+            )
+
+    # ChromaDB에서 사용자 선호 음식 검색
+    preferred_meals = []
+    try:
+        context_str = context.strip()
+        breakfast_meals = search_user_preferred_meals(
+            user_number=user.user_number,
+            goal_type=goal_type,
+            target_calorie=float(target_calorie) if target_calorie else 2000.0,
+            meal_type="breakfast",
+            context=context_str,
+            n_results=3,
+        )
+        lunch_meals = search_user_preferred_meals(
+            user_number=user.user_number,
+            goal_type=goal_type,
+            target_calorie=float(target_calorie) if target_calorie else 2000.0,
+            meal_type="lunch",
+            context=context_str,
+            n_results=3,
+        )
+        dinner_meals = search_user_preferred_meals(
+            user_number=user.user_number,
+            goal_type=goal_type,
+            target_calorie=float(target_calorie) if target_calorie else 2000.0,
+            meal_type="dinner",
+            context=context_str,
+            n_results=3,
+        )
+        preferred_meals = breakfast_meals + lunch_meals + dinner_meals
+    except Exception as e:
+        logger.warning("벡터 검색 실패 (무시하고 계속 진행): %s", e)
+
+    prompt = {
+        "goal_type": goal_type,
+        "target_calorie": round(float(target_calorie)) if target_calorie else None,
+        "body_type_stage1": body_stage1,
+        "body_type_stage2": body_stage2,
+        "user_context": context.strip(),
+        "latest_inbody": {
+            "height_cm": latest_inbody.height,
+            "weight_kg": latest_inbody.weight,
+            "body_fat_pct": latest_inbody.body_fat_pct,
+            "skeletal_muscle_kg": latest_inbody.skeletal_muscle_mass,
+            "bmr_kcal": latest_inbody.bmr,
+        },
+        "activity_level": normalize_activity_level(profile.activity_level) if profile else None,
+        "notes": [
+            "한국어로만 작성한다.",
+            "1일치(1일) 식단을 제공한다.",
+            "사용자의 특별 요청(user_context)을 최우선으로 고려하여 식단을 구성한다.",
+            "각 일자는 아침/점심/저녁으로 구성한다.",
+            "일일 총칼로리는 목표 칼로리 ±10% 범위를 지향한다.",
+            "식단 이름은 한국어로 자연스럽고 구체적으로 작성한다.",
+            "영양값은 추정치이며 현실적인 범위로 작성한다.",
+            "요즘 한국에서 많이 먹는 대중적이고 익숙한 메뉴 위주로 구성한다.",
+            "지나치게 방대한 메뉴 구성을 피하고 현실적으로 준비 가능한 수준으로 제안한다.",
+        ],
+    }
+
+    try:
+        plan = generate_one_day_plan(prompt, preferred_meals=preferred_meals)
     except Exception as exc:
         raise HTTPException(
             status_code=500,
@@ -1143,24 +1477,47 @@ def get_diet_plan_places(
     """내 위치 기반 주변 편의점/음식점 10곳 반환"""
     lat = float(payload.lat)  # 위도 (latitude)
     lng = float(payload.lng)  # 경도 (longitude)
-    radius_m = payload.radius_m or 2000
+    base_radius_m = payload.radius_m or 2000
     food_name = (payload.food_name or "").strip()
 
     categories = ["CS2", "FD6"]  # 편의점, 음식점
-    raw_places: List[dict] = []
+    queries: List[str] = []
+    tokens: List[str] = []
     if food_name:
-        raw_places.extend(_kakao_local_search_keyword(lat, lng, radius_m, food_name))
-    for code in categories:
-        raw_places.extend(_kakao_local_search_category(lat, lng, radius_m, code))
+        queries = _build_place_queries(food_name)
+        tokens = _extract_food_tokens(food_name)
+
+    def _search_with_radius(radius_m: int) -> List[dict]:
+        results: List[dict] = []
+        if queries:
+            for q in queries:
+                results.extend(_kakao_local_search_keyword(lat, lng, radius_m, q))
+        # 결과가 부족하면 카테고리 검색으로 보강
+        if len(results) < 8:
+            for code in categories:
+                results.extend(_kakao_local_search_category(lat, lng, radius_m, code))
+        return results
+
+    def _add_dedup(items: List[dict], dedup: dict[str, dict]) -> None:
+        for item in items:
+            place_id = str(item.get("id"))
+            if not place_id or place_id in dedup:
+                continue
+            dedup[place_id] = item
+
+    radius_steps = [base_radius_m]
+    if base_radius_m < 10000:
+        radius_steps.append(10000)
+    if base_radius_m < 15000:
+        radius_steps.append(15000)
+    if base_radius_m < 20000:
+        radius_steps.append(20000)
 
     dedup: dict[str, dict] = {}
-    for item in raw_places:
-        place_id = str(item.get("id"))
-        if not place_id:
-            continue
-        if place_id in dedup:
-            continue
-        dedup[place_id] = item
+    for radius_m in radius_steps:
+        _add_dedup(_search_with_radius(radius_m), dedup)
+        if len(dedup) >= 10:
+            break
 
     def _distance_value(value: Optional[str]) -> int:
         try:
@@ -1168,7 +1525,13 @@ def get_diet_plan_places(
         except Exception:
             return 10**9
 
-    sorted_items = sorted(dedup.values(), key=lambda x: _distance_value(x.get("distance")))
+    if tokens:
+        sorted_items = sorted(
+            dedup.values(),
+            key=lambda x: (-_place_score(x, tokens, queries), _distance_value(x.get("distance"))),
+        )
+    else:
+        sorted_items = sorted(dedup.values(), key=lambda x: _distance_value(x.get("distance")))
     limited = sorted_items[:10]
 
     places: List[DietPlanPlaceItem] = []
@@ -1250,6 +1613,21 @@ def create_records_from_plan(
         db.add(rec)
         db.flush()
         record_ids.append(rec.record_id)
+
+        # ChromaDB에 벡터 저장
+        try:
+            upsert_meal_record(
+                record_id=rec.record_id,
+                user_number=user.user_number,
+                food_name=meal.name.strip(),
+                meal_type=meal_type,
+                calories=float(meal.calories_kcal),
+                protein=float(meal.protein_g),
+                carb=float(meal.carbs_g),
+                fat=float(meal.fat_g),
+            )
+        except Exception as e:
+            logger.warning("ChromaDB 저장 실패 (무시): %s", e)
 
     db.commit()
     return {"record_ids": record_ids}
@@ -1942,6 +2320,14 @@ def delete_day_records(
     start = day
     end = day + timedelta(days=1)
 
+    # 삭제 전에 record_id 목록을 조회 (ChromaDB 동기화용)
+    records_to_delete = db.query(Record.record_id).filter(
+        Record.user_number == current_user.user_number,
+        Record.record_created_at >= start,
+        Record.record_created_at < end,
+    ).all()
+    record_ids = [r.record_id for r in records_to_delete]
+
     db.query(Record).filter(
         Record.user_number == current_user.user_number,
         Record.record_created_at >= start,
@@ -1949,6 +2335,14 @@ def delete_day_records(
     ).delete(synchronize_session=False)
 
     db.commit()
+
+    # ChromaDB에서도 벌크 삭제
+    if record_ids:
+        try:
+            delete_meal_records_bulk(record_ids)
+        except Exception as e:
+            logger.warning("ChromaDB 벌크 삭제 실패 (무시): %s", e)
+
     return
     
 
@@ -1970,6 +2364,12 @@ def delete_record(
 
     db.delete(record)
     db.commit()
+
+    # ChromaDB에서도 삭제
+    try:
+        delete_meal_record(record_id)
+    except Exception as e:
+        logger.warning("ChromaDB 삭제 실패 (무시): %s", e)
 
     return {"record_id": record_id, "message": "식단 기록이 삭제되었습니다."}
 
@@ -2037,6 +2437,21 @@ async def vision_food(
         db.add(rec)
         db.commit()
         db.refresh(rec)
+
+        # ChromaDB에 벡터 저장
+        try:
+            upsert_meal_record(
+                record_id=rec.record_id,
+                user_number=user_number,
+                food_name=decision["chosen_food"],
+                meal_type=meal_type,
+                calories=float(nutrition.get("calories_kcal") or 0),
+                protein=float(nutrition.get("protein_g") or 0),
+                carb=float(nutrition.get("carbs_g") or 0),
+                fat=float(nutrition.get("fat_g") or 0),
+            )
+        except Exception as e:
+            logger.warning("ChromaDB 저장 실패 (무시): %s", e)
 
         return {
             "far_id": far.far_id,
@@ -2114,6 +2529,23 @@ def classify_by_user(
     record.classify_name = result.stage2
     db.commit()
     return result
+
+
+@app.get("/api/debug/vector-store")
+def debug_vector_store_peek(limit: int = 10):
+    """(임시) ChromaDB 데이터 확인용 엔드포인트"""
+    try:
+        collection = get_collection()
+        count = collection.count()
+        items = collection.peek(limit=limit)
+        return {
+            "message": "ChromaDB 'user_meal_records' collection",
+            "count": count,
+            "items": items
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 if __name__ == "__main__":
     import uvicorn
