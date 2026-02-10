@@ -30,6 +30,8 @@ class User(Base):
     food_analysis_results = relationship("FoodAnalysisResult", back_populates="user")
     diet_plans = relationship("UserDietPlan", back_populates="user")
     location_profiles = relationship("LocationProfile", back_populates="user")
+
+    meal_recommendations = relationship("MealRecommendation", back_populates="user")
     pipeline_runs = relationship("PipelineRun", back_populates="user")
     
     def __repr__(self):
@@ -292,9 +294,9 @@ class DailyActivity(Base):
         )
 
 
-class LocationProfile(Base):
-    """사용자별 집/회사 위치 프로필 (데이터 수집 Agent용)"""
+class LocationProfile(Base)
 
+    """사용자별 집/회사 위치 프로필"""
     __tablename__ = "location_profiles"
 
     location_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
@@ -308,7 +310,7 @@ class LocationProfile(Base):
 
     __table_args__ = (
         UniqueConstraint("user_number", "label", name="uq_location_profile_user_label"),
-        Index("ix_location_profiles_user_number", "user_number"),
+        Index("ix_location_profile_user", "user_number"),
     )
 
     user = relationship("User", back_populates="location_profiles")
@@ -319,15 +321,14 @@ class LocationProfile(Base):
 
 
 class Restaurant(Base):
-    """음식점 마스터 (중복 없음)"""
-
+    """반경 내 음식점 마스터"""
     __tablename__ = "restaurants"
 
     restaurant_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    source = Column(String(20), nullable=False, server_default="kakao")
+    source = Column(String(50), nullable=False)  # kakao/naver/etc
     source_place_id = Column(String(100), nullable=False)
-    name = Column(String(255), nullable=False)
-    category = Column(String(255), nullable=True)
+    name = Column(String(200), nullable=False)
+    category = Column(String(200), nullable=True)
     address_text = Column(String(255), nullable=True)
     lat = Column(Float, nullable=True)
     lng = Column(Float, nullable=True)
@@ -337,8 +338,8 @@ class Restaurant(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     __table_args__ = (
-        UniqueConstraint("source", "source_place_id", name="uq_restaurants_source_place_id"),
-        Index("ix_restaurants_source_place_id", "source", "source_place_id"),
+        UniqueConstraint("source", "source_place_id", name="uq_restaurant_source_place"),
+        Index("ix_restaurant_source_place", "source", "source_place_id"),
     )
 
     menu_items = relationship("MenuItem", back_populates="restaurant")
@@ -360,51 +361,51 @@ class RestaurantSnapshot(Base):
     collected_at = Column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
-        Index("ix_restaurant_snapshots_location_profile_id", "location_profile_id"),
-        Index("ix_restaurant_snapshots_restaurant_id", "restaurant_id"),
+        UniqueConstraint("location_profile_id", "restaurant_id", name="uq_snapshot_location_restaurant"),
+        Index("ix_restaurant_snapshot_location", "location_profile_id"),
+        Index("ix_restaurant_snapshot_restaurant", "restaurant_id"),
     )
 
     location_profile = relationship("LocationProfile", back_populates="restaurant_snapshots")
-    restaurant = relationship("Restaurant", back_populates="snapshots")
+    restaurant = relationship("Restaurant", back_populates="restaurant_snapshots")
 
     def __repr__(self):
         return f"<RestaurantSnapshot(snapshot_id={self.snapshot_id}, restaurant_id={self.restaurant_id})>"
 
 
 class MenuItem(Base):
-    """음식점별 메뉴 아이템"""
-
+    """음식점별 메뉴 마스터"""
     __tablename__ = "menu_items"
 
     menu_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     restaurant_id = Column(Integer, ForeignKey("restaurants.restaurant_id"), nullable=False)
-    name = Column(String(255), nullable=False)
+    name = Column(String(200), nullable=False)
     description = Column(Text, nullable=True)
-    price = Column(Integer, nullable=True)
-    source = Column(String(20), nullable=False, server_default="scraping")  # scraping/ocr/manual
-    source_url = Column(String(1024), nullable=True)
+    price = Column(Float, nullable=True)
+    source = Column(String(50), nullable=True)  # scraping/ocr/manual
+    source_url = Column(String(500), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     __table_args__ = (
-        UniqueConstraint("restaurant_id", "name", name="uq_menu_items_restaurant_name"),
-        Index("ix_menu_items_restaurant_id", "restaurant_id"),
+        UniqueConstraint("restaurant_id", "name", name="uq_menu_item_restaurant_name"),
+        Index("ix_menu_item_restaurant", "restaurant_id"),
     )
 
     restaurant = relationship("Restaurant", back_populates="menu_items")
-    nutrition_fact = relationship("NutritionFact", back_populates="menu_item", uselist=False)
+    nutrition_facts = relationship("NutritionFacts", back_populates="menu_item")
 
     def __repr__(self):
         return f"<MenuItem(menu_id={self.menu_id}, name='{self.name}')>"
 
 
-class NutritionFact(Base):
-    """메뉴별 영양 정보 (검색/추론 기반 포함)"""
 
+class NutritionFacts(Base):
+    """메뉴별 영양 정보"""
     __tablename__ = "nutrition_facts"
 
     nutrition_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    menu_item_id = Column(Integer, ForeignKey("menu_items.menu_id"), nullable=False, unique=True)
+    menu_item_id = Column(Integer, ForeignKey("menu_items.menu_id"), nullable=False)
     calories_kcal = Column(Float, nullable=True)
     carbs_g = Column(Float, nullable=True)
     protein_g = Column(Float, nullable=True)
@@ -412,63 +413,142 @@ class NutritionFact(Base):
     sodium_mg = Column(Float, nullable=True)
     sugar_g = Column(Float, nullable=True)
     fiber_g = Column(Float, nullable=True)
-    source_type = Column(String(20), nullable=False, server_default="infer")  # search/infer/manual
-    source_ref = Column(Text, nullable=True)  # URL or reference JSON/text
-    confidence = Column(Float, nullable=False, server_default="0")
+    source_type = Column(String(20), nullable=False)  # search/infer/manual
+    source_ref = Column(Text, nullable=True)
+    confidence = Column(Float, nullable=True)  # 0~1
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
-    __table_args__ = (Index("ix_nutrition_facts_menu_item_id", "menu_item_id"),)
+    __table_args__ = (
+        Index("ix_nutrition_menu", "menu_item_id"),
+    )
 
-    menu_item = relationship("MenuItem", back_populates="nutrition_fact")
+    menu_item = relationship("MenuItem", back_populates="nutrition_facts")
 
     def __repr__(self):
-        return f"<NutritionFact(nutrition_id={self.nutrition_id}, menu_item_id={self.menu_item_id})>"
+        return f"<NutritionFacts(nutrition_id={self.nutrition_id}, menu_item_id={self.menu_item_id})>"
+
+
+class MealRecommendation(Base):
+    """최종 추천 결과"""
+    __tablename__ = "meal_recommendations"
+
+    recommendation_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    user_number = Column(Integer, ForeignKey("users.user_number"), nullable=False)
+    meal_type = Column(String(20), nullable=False)  # breakfast/lunch/dinner
+    menu_item_id = Column(Integer, ForeignKey("menu_items.menu_id"), nullable=False)
+    reason_text = Column(Text, nullable=True)
+    score_nutrition = Column(Float, nullable=True)
+    score_accessibility = Column(Float, nullable=True)
+    total_score = Column(Float, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_meal_reco_user", "user_number"),
+        Index("ix_meal_reco_meal", "meal_type"),
+    )
+
+    user = relationship("User", back_populates="meal_recommendations")
+    menu_item = relationship("MenuItem")
+
+    def __repr__(self):
+        return f"<MealRecommendation(recommendation_id={self.recommendation_id}, meal_type='{self.meal_type}')>"
 
 
 class PipelineRun(Base):
     """에이전트 워크플로우 실행 기록"""
-
     __tablename__ = "pipeline_runs"
 
     run_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     user_number = Column(Integer, ForeignKey("users.user_number"), nullable=False)
-    input_payload = Column(Text, nullable=True)
-    status = Column(String(20), nullable=False, server_default="running")
-    started_at = Column(DateTime(timezone=True), server_default=func.now())
-    finished_at = Column(DateTime(timezone=True), nullable=True)
-    error_message = Column(Text, nullable=True)
 
-    __table_args__ = (Index("ix_pipeline_runs_user_number", "user_number"),)
-
-    user = relationship("User", back_populates="pipeline_runs")
-    items = relationship("PipelineRunItem", back_populates="pipeline_run")
-
-    def __repr__(self):
-        return f"<PipelineRun(run_id={self.run_id}, user_number={self.user_number}, status='{self.status}')>"
-
-
-class PipelineRunItem(Base):
-    """노드별 실행 기록 (선택)"""
-
-    __tablename__ = "pipeline_run_items"
-
-    run_item_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    pipeline_run_id = Column(Integer, ForeignKey("pipeline_runs.run_id"), nullable=False)
-    node_name = Column(String(50), nullable=False)
-    input_payload = Column(Text, nullable=True)
-    output_payload = Column(Text, nullable=True)
+    input_payload = Column(Text, nullable=True)  # JSON string
     status = Column(String(20), nullable=False, server_default="running")
     started_at = Column(DateTime(timezone=True), server_default=func.now())
     finished_at = Column(DateTime(timezone=True), nullable=True)
     error_message = Column(Text, nullable=True)
 
     __table_args__ = (
-        Index("ix_pipeline_run_items_pipeline_run_id", "pipeline_run_id"),
-        Index("ix_pipeline_run_items_node_name", "node_name"),
+        Index("ix_pipeline_run_user", "user_number"),
     )
 
-    pipeline_run = relationship("PipelineRun", back_populates="items")
+    user = relationship("User", back_populates="pipeline_runs")
+    run_items = relationship("PipelineRunItem", back_populates="pipeline_run")
 
     def __repr__(self):
-        return f"<PipelineRunItem(run_item_id={self.run_item_id}, node_name='{self.node_name}', status='{self.status}')>"
+        return f"<PipelineRun(run_id={self.run_id}, user_number={self.user_number}, status='{self.status}')>"
+
+
+class PipelineRunItem(Base):
+
+    """노드별 실행 기록"""
+    __tablename__ = "pipeline_run_items"
+
+    run_item_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    pipeline_run_id = Column(Integer, ForeignKey("pipeline_runs.run_id"), nullable=False)
+
+    node_name = Column(String(50), nullable=False)  # A/B/C/Final
+    input_payload = Column(Text, nullable=True)  # JSON string
+    output_payload = Column(Text, nullable=True)  # JSON string
+    status = Column(String(20), nullable=False, server_default="running")
+    started_at = Column(DateTime(timezone=True), server_default=func.now())
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+    error_message = Column(Text, nullable=True)
+
+    __table_args__ = (
+
+        Index("ix_pipeline_run_item_run", "pipeline_run_id"),
+        Index("ix_pipeline_run_item_node", "node_name"),
+    )
+
+    pipeline_run = relationship("PipelineRun", back_populates="run_items")
+
+    def __repr__(self):
+        return f"<PipelineRunItem(run_item_id={self.run_item_id}, node_name='{self.node_name}')>"
+
+
+class MenuCollectionJob(Base):
+    """Node B 메뉴 수집 작업"""
+    __tablename__ = "menu_collection_jobs"
+
+    job_id = Column(String(50), primary_key=True)
+    status = Column(String(20), nullable=False, server_default="queued")
+    requested_count = Column(Integer, nullable=False, server_default="0")
+    success_count = Column(Integer, nullable=False, server_default="0")
+    failure_count = Column(Integer, nullable=False, server_default="0")
+    request_payload = Column(Text, nullable=True)  # JSON string
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    errors = Column(Text, nullable=True)  # JSON string
+
+    __table_args__ = (
+        Index("ix_menu_collection_job_status", "status"),
+    )
+
+    failures = relationship("MenuCollectionFailure", back_populates="job")
+
+    def __repr__(self):
+        return f"<MenuCollectionJob(job_id={self.job_id}, status='{self.status}')>"
+
+
+class MenuCollectionFailure(Base):
+    """Node B 메뉴 수집 실패 기록"""
+    __tablename__ = "menu_collection_failures"
+
+    failure_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    job_id = Column(String(50), ForeignKey("menu_collection_jobs.job_id"), nullable=False)
+    restaurant_id = Column(Integer, nullable=True)
+    stage = Column(String(30), nullable=False)
+    reason = Column(String(50), nullable=False)
+    detail = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_menu_collection_failure_job", "job_id"),
+    )
+
+    job = relationship("MenuCollectionJob", back_populates="failures")
+
+    def __repr__(self):
+        return f"<MenuCollectionFailure(failure_id={self.failure_id}, job_id='{self.job_id}')>"
