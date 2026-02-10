@@ -30,6 +30,7 @@ class User(Base):
     food_analysis_results = relationship("FoodAnalysisResult", back_populates="user")
     diet_plans = relationship("UserDietPlan", back_populates="user")
     location_profiles = relationship("LocationProfile", back_populates="user")
+
     meal_recommendations = relationship("MealRecommendation", back_populates="user")
     pipeline_runs = relationship("PipelineRun", back_populates="user")
     
@@ -293,7 +294,8 @@ class DailyActivity(Base):
         )
 
 
-class LocationProfile(Base):
+class LocationProfile(Base)
+
     """사용자별 집/회사 위치 프로필"""
     __tablename__ = "location_profiles"
 
@@ -331,7 +333,7 @@ class Restaurant(Base):
     lat = Column(Float, nullable=True)
     lng = Column(Float, nullable=True)
     phone = Column(String(50), nullable=True)
-    place_url = Column(String(500), nullable=True)
+    place_url = Column(String(1024), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -340,15 +342,16 @@ class Restaurant(Base):
         Index("ix_restaurant_source_place", "source", "source_place_id"),
     )
 
-    restaurant_snapshots = relationship("RestaurantSnapshot", back_populates="restaurant")
     menu_items = relationship("MenuItem", back_populates="restaurant")
+    snapshots = relationship("RestaurantSnapshot", back_populates="restaurant")
 
     def __repr__(self):
         return f"<Restaurant(restaurant_id={self.restaurant_id}, name='{self.name}')>"
 
 
 class RestaurantSnapshot(Base):
-    """검색 시점의 음식점 스냅샷"""
+    """Location 기준 수집 시점 스냅샷"""
+
     __tablename__ = "restaurant_snapshots"
 
     snapshot_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
@@ -394,6 +397,7 @@ class MenuItem(Base):
 
     def __repr__(self):
         return f"<MenuItem(menu_id={self.menu_id}, name='{self.name}')>"
+
 
 
 class NutritionFacts(Base):
@@ -457,6 +461,7 @@ class PipelineRun(Base):
 
     run_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     user_number = Column(Integer, ForeignKey("users.user_number"), nullable=False)
+
     input_payload = Column(Text, nullable=True)  # JSON string
     status = Column(String(20), nullable=False, server_default="running")
     started_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -475,11 +480,13 @@ class PipelineRun(Base):
 
 
 class PipelineRunItem(Base):
+
     """노드별 실행 기록"""
     __tablename__ = "pipeline_run_items"
 
     run_item_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     pipeline_run_id = Column(Integer, ForeignKey("pipeline_runs.run_id"), nullable=False)
+
     node_name = Column(String(50), nullable=False)  # A/B/C/Final
     input_payload = Column(Text, nullable=True)  # JSON string
     output_payload = Column(Text, nullable=True)  # JSON string
@@ -489,6 +496,7 @@ class PipelineRunItem(Base):
     error_message = Column(Text, nullable=True)
 
     __table_args__ = (
+
         Index("ix_pipeline_run_item_run", "pipeline_run_id"),
         Index("ix_pipeline_run_item_node", "node_name"),
     )
