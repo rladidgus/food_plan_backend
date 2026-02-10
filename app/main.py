@@ -2115,6 +2115,33 @@ def classify_by_user(
     db.commit()
     return result
 
+
+class FetchNutritionRequest(BaseModel):
+    menu_item_ids: List[int]
+    openai_model: Optional[str] = "gpt-4.1-mini"
+    delay_s: float = 0.2
+
+
+class FetchNutritionResponse(BaseModel):
+    nutrition_ids: List[int]
+
+
+@app.post("/agent/nutrition/fetch", response_model=FetchNutritionResponse)
+def agent_fetch_nutrition(
+    payload: FetchNutritionRequest,
+    db: Session = Depends(get_db),
+):
+    from app.nodes.c_fetch_nutrition import c_fetch_nutrition
+
+    nutrition_ids = c_fetch_nutrition(
+        db,
+        menu_item_ids=payload.menu_item_ids,
+        openai_model=payload.openai_model or "gpt-4.1-mini",
+        delay_s=payload.delay_s,
+    )
+    return FetchNutritionResponse(nutrition_ids=nutrition_ids)
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="localhost", port=8000)
