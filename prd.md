@@ -77,7 +77,7 @@ app/
 
 **목적**: 주어진 주소 기준 반경 500m 내 음식점 리스트 수집
 
-**데이터 소스**: Kakao Local API (`/v2/local/search/keyword`)
+**데이터 소스**: naver local api (`/v2/local/search/keyword`)
 
 **입력**:
 - `address_text`: 사용자 주소 (예: "서울 강남구 테헤란로 123")
@@ -346,7 +346,7 @@ class AgentState(TypedDict):
 | 구분 | 기술 |
 |------|------|
 | Agent 프레임워크 | LangGraph |
-| LLM | Claude API (영양정보 추론 fallback) |
+| LLM | openai API (영양정보 추론 fallback) |
 | 음식점 검색 | Kakao Local API |
 | 메뉴 수집 | 웹 스크래핑 (httpx + BeautifulSoup) |
 | 영양정보 검색 | 웹서치 API (Tavily / SerpAPI 등) |
