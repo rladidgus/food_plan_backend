@@ -1,2 +1,2 @@
-"""Agent/services package."""
+"""Service layer package."""
 
