@@ -30,7 +30,7 @@
          │
          ▼
  ┌─────────────────────┐
- │  A_fetch_restaurants │  Kakao Local API로 반경 내 음식점 수집
+ │  A_fetch_restaurants │  Naver Maps API로 반경 내 음식점 수집
  └─────────┬───────────┘
            │ restaurants[]
            ▼
@@ -64,7 +64,7 @@ app/
 ├── models.py             # SQLAlchemy ORM 모델 (스키마 정의)
 ├── schemas.py            # Pydantic 스키마 (State, Input/Output)
 └── services/
-    ├── kakao_api.py      # Kakao Local API 클라이언트
+    ├── naver_api.py      # Naver Maps API 클라이언트
     ├── menu_scraper.py   # 메뉴 스크래핑 서비스
     └── nutrition_searcher.py  # 영양정보 검색/추론 서비스
 ```
@@ -77,14 +77,14 @@ app/
 
 **목적**: 주어진 주소 기준 반경 500m 내 음식점 리스트 수집
 
-**데이터 소스**: Kakao Local API (`/v2/local/search/keyword`)
+**데이터 소스**: Naver Maps API (Local Search)
 
 **입력**:
 - `address_text`: 사용자 주소 (예: "서울 강남구 테헤란로 123")
 - `radius_m`: 검색 반경 (기본값: 500)
 
 **처리 흐름**:
-1. 주소 → 좌표 변환 (Kakao Geocoding API)
+1. 주소 → 좌표 변환 (Naver Geocoding API)
 2. 좌표 + 반경으로 음식점 카테고리 검색
 3. 페이지네이션 처리 (최대 45건 = 15건 × 3페이지)
 4. 결과를 `restaurants` 테이블에 upsert (source + source_place_id 기준)
@@ -93,18 +93,18 @@ app/
 **출력 State**:
 - `restaurant_ids: list[int]` — 수집된 음식점 ID 목록
 
-**Kakao API 필드 매핑**:
+**Naver API 필드 매핑**:
 
-| Kakao 응답 필드 | DB 컬럼 |
+| Naver 응답 필드 | DB 컬럼 |
 |-----------------|---------|
-| `id` | `source_place_id` |
-| `place_name` | `name` |
-| `category_group_name` | `category` |
-| `road_address_name` | `address_text` |
-| `y` | `lat` |
-| `x` | `lng` |
-| `phone` | `phone` |
-| `place_url` | `place_url` |
+| `link` (또는 place id) | `source_place_id` |
+| `title` | `name` |
+| `category` | `category` |
+| `roadAddress` | `address_text` |
+| `mapy` | `lat` |
+| `mapx` | `lng` |
+| `telephone` | `phone` |
+| `link` | `place_url` |
 
 ### 3.2 Node B: `B_fetch_menus`
 
@@ -215,7 +215,7 @@ users (기존)
 | 컬럼 | 타입 | 설명 |
 |------|------|------|
 | `restaurant_id` | `SERIAL PK` | |
-| `source` | `VARCHAR(20)` | `'kakao'` |
+| `source` | `VARCHAR(20)` | `'naver'` |
 | `source_place_id` | `VARCHAR(50)` | 외부 API 고유 ID |
 | `name` | `VARCHAR(200)` | 음식점명 |
 | `category` | `VARCHAR(100)` | 카테고리 |
@@ -347,7 +347,7 @@ class AgentState(TypedDict):
 |------|------|
 | Agent 프레임워크 | LangGraph |
 | LLM | Claude API (영양정보 추론 fallback) |
-| 음식점 검색 | Kakao Local API |
+| 음식점 검색 | Naver Maps API |
 | 메뉴 수집 | 웹 스크래핑 (httpx + BeautifulSoup) |
 | 영양정보 검색 | 웹서치 API (Tavily / SerpAPI 등) |
 | ORM | SQLAlchemy |
