@@ -497,3 +497,50 @@ class PipelineRunItem(Base):
 
     def __repr__(self):
         return f"<PipelineRunItem(run_item_id={self.run_item_id}, node_name='{self.node_name}')>"
+
+
+class MenuCollectionJob(Base):
+    """Node B 메뉴 수집 작업"""
+    __tablename__ = "menu_collection_jobs"
+
+    job_id = Column(String(50), primary_key=True)
+    status = Column(String(20), nullable=False, server_default="queued")
+    requested_count = Column(Integer, nullable=False, server_default="0")
+    success_count = Column(Integer, nullable=False, server_default="0")
+    failure_count = Column(Integer, nullable=False, server_default="0")
+    request_payload = Column(Text, nullable=True)  # JSON string
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    errors = Column(Text, nullable=True)  # JSON string
+
+    __table_args__ = (
+        Index("ix_menu_collection_job_status", "status"),
+    )
+
+    failures = relationship("MenuCollectionFailure", back_populates="job")
+
+    def __repr__(self):
+        return f"<MenuCollectionJob(job_id={self.job_id}, status='{self.status}')>"
+
+
+class MenuCollectionFailure(Base):
+    """Node B 메뉴 수집 실패 기록"""
+    __tablename__ = "menu_collection_failures"
+
+    failure_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    job_id = Column(String(50), ForeignKey("menu_collection_jobs.job_id"), nullable=False)
+    restaurant_id = Column(Integer, nullable=True)
+    stage = Column(String(30), nullable=False)
+    reason = Column(String(50), nullable=False)
+    detail = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_menu_collection_failure_job", "job_id"),
+    )
+
+    job = relationship("MenuCollectionJob", back_populates="failures")
+
+    def __repr__(self):
+        return f"<MenuCollectionFailure(failure_id={self.failure_id}, job_id='{self.job_id}')>"

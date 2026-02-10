@@ -36,6 +36,7 @@ from app.vector_store import (
     get_collection,
     migrate_existing_records,
 )
+from app.api.menus import router as menus_router
 
 # Supabase 클라이언트 초기화
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -90,6 +91,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(menus_router, prefix="/api/v1", tags=["menus"])
 
 
 # Pydantic 모델 (요청/응답 스키마)
