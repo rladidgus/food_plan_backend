@@ -36,6 +36,7 @@ from app.vector_store import (
     get_collection,
     migrate_existing_records,
 )
+from app.api.menus import router as menus_router
 
 # Supabase 클라이언트 초기화
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -90,6 +91,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(menus_router, prefix="/api/v1", tags=["menus"])
 
 
 # Pydantic 모델 (요청/응답 스키마)
@@ -2530,6 +2533,31 @@ def classify_by_user(
     db.commit()
     return result
 
+
+class FetchNutritionRequest(BaseModel):
+    menu_item_ids: List[int]
+    openai_model: Optional[str] = "gpt-4.1-mini"
+    delay_s: float = 0.2
+
+
+class FetchNutritionResponse(BaseModel):
+    nutrition_ids: List[int]
+
+
+@app.post("/agent/nutrition/fetch", response_model=FetchNutritionResponse)
+def agent_fetch_nutrition(
+    payload: ,
+    db: Session = Depends(get_db),
+):
+    from app.nodes.c_fetch_nutrition import c_fetch_nutrition
+
+    nutrition_ids = c_fetch_nutrition(
+        db,
+        menu_item_ids=payload.menu_item_ids,
+        openai_model=payload.openai_model or "gpt-4.1-mini",
+        delay_s=payload.delay_s,
+    )
+    return FetchNutritionResponse(nutrition_ids=nutrition_ids)
 
 @app.get("/api/debug/vector-store")
 def debug_vector_store_peek(limit: int = 10):
