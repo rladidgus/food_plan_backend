@@ -7,6 +7,7 @@ import time
 import json
 from typing import Dict, List, Optional
 from uuid import uuid4
+import os
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, validator
@@ -102,6 +103,9 @@ def _run_job(
         job.started_at = datetime.now(timezone.utc)
         db.commit()
 
+        retry_count = int(os.getenv("MENU_COLLECTION_RETRY", "1"))
+        min_items = int(os.getenv("MENU_MIN_ITEMS", "1"))
+
         for restaurant_id in restaurant_ids:
             menu_item_ids, failures = collect_menus_for_restaurants(
                 db,
@@ -109,6 +113,8 @@ def _run_job(
                 method_priority,
                 llm_fallback,
                 naver_validation,
+                retry_count=retry_count,
+                min_items=min_items,
             )
             if menu_item_ids:
                 job.success_count += 1

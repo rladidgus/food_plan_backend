@@ -12,7 +12,7 @@
 - 출력: `location_profile_id`, `lat`, `lng`, `restaurant_ids`
 
 **의존성**
-- `services/naver_api.py`: geocoding + local search
+- `services/naver_api.py`: geocoding + place search
 - `models.py`: `LocationProfile`, `Restaurant`, `RestaurantSnapshot`
 - `schemas.py`: `AgentState`
 - DB: PostgreSQL, unique 제약 준수
@@ -20,13 +20,13 @@
 **데이터 매핑 (Naver → DB)**
 | Naver 필드 | DB 컬럼 |
 | --- | --- |
-| link (또는 place id) | restaurants.source_place_id |
-| title | restaurants.name |
+| id | restaurants.source_place_id |
+| name | restaurants.name |
 | category | restaurants.category |
-| roadAddress | restaurants.address_text |
-| mapy | restaurants.lat |
-| mapx | restaurants.lng |
-| telephone | restaurants.phone |
+| road_address | restaurants.address_text |
+| y | restaurants.lat |
+| x | restaurants.lng |
+| tel | restaurants.phone |
 | link | restaurants.place_url |
 
 **처리 흐름**
@@ -36,7 +36,7 @@
 - `UNIQUE(user_number, label)` 기준으로 기존 레코드 조회 후 업데이트
 - 없으면 새로 생성
 4. 음식점 검색
-- Naver Local Search API 사용
+- Naver Maps Place Search API 사용
 - 반경 `radius_m` (기본 500m)
 - 페이지네이션 최대 3페이지, 페이지당 15건
 5. 음식점 upsert

@@ -34,26 +34,38 @@ def node_b_fetch_menus(state: State) -> State:
     llm_fallback = os.getenv("MENU_LLM_FALLBACK", "true").lower() == "true"
     naver_validation = os.getenv("MENU_NAVER_VALIDATION", "true").lower() == "true"
     rate_limit_ms = int(os.getenv("MENU_RATE_LIMIT_MS", "800"))
+    retry_count = int(os.getenv("MENU_COLLECTION_RETRY", "1"))
+    min_items = int(os.getenv("MENU_MIN_ITEMS", "1"))
 
     db: Session = SessionLocal()
     try:
-        menu_item_ids, failures = collect_menus_for_restaurants(
-            db,
-            restaurant_ids,
-            method_priority_list,
-            llm_fallback,
-            naver_validation,
-        )
-        db.commit()
-        state["menu_item_ids"] = menu_item_ids
-        if failures:
+        collected_ids: List[int] = []
+        failures_all: List[dict] = []
+
+        for restaurant_id in restaurant_ids:
+            menu_item_ids, failures = collect_menus_for_restaurants(
+                db,
+                [restaurant_id],
+                method_priority_list,
+                llm_fallback,
+                naver_validation,
+                retry_count=retry_count,
+                min_items=min_items,
+            )
+            db.commit()
+            collected_ids.extend(menu_item_ids)
+            failures_all.extend(failures)
+
+            if rate_limit_ms:
+                time.sleep(rate_limit_ms / 1000.0)
+
+        state["menu_item_ids"] = collected_ids
+        if failures_all:
             state.setdefault("errors", [])
-            for failure in failures:
+            for failure in failures_all:
                 state["errors"].append(
                     f"restaurant_id={failure.get('restaurant_id')} reason={failure.get('reason')}"
                 )
-        if rate_limit_ms:
-            time.sleep(rate_limit_ms / 1000.0)
     finally:
         db.close()
     return state

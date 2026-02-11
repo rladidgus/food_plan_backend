@@ -77,8 +77,8 @@ def _extract_distance_m(item: Dict[str, Any], lat: float, lng: float) -> Optiona
     distance = _safe_float(item.get("distance"))
     if distance is not None:
         return distance
-    item_lat = _safe_float(item.get("mapy"))
-    item_lng = _safe_float(item.get("mapx"))
+    item_lat = _safe_float(item.get("y") or item.get("lat"))
+    item_lng = _safe_float(item.get("x") or item.get("lng"))
     if item_lat is None or item_lng is None:
         return None
     return _haversine_distance_m(lat, lng, item_lat, item_lng)
@@ -159,7 +159,13 @@ def node_a_fetch_restaurants(state: State) -> State:
         return state
 
     try:
-        items = naver_api.search_restaurants(lat=lat, lng=lng, radius_m=radius_m, page_size=PAGE_SIZE, max_pages=MAX_PAGES)
+        items = naver_api.search_restaurants(
+            lat=lat,
+            lng=lng,
+            radius_m=radius_m,
+            page_size=PAGE_SIZE,
+            max_pages=MAX_PAGES,
+        )
     except Exception as exc:
         logger.exception("Naver local search failed: %s", exc)
         errors.append("Naver Local Search API 실패")
@@ -179,15 +185,15 @@ def node_a_fetch_restaurants(state: State) -> State:
             continue
         seen.add(source_place_id)
 
-        name = _clean_title(item.get("title") or item.get("name"))
+        name = _clean_title(item.get("name") or item.get("place_name"))
         if not name:
             continue
 
         category = item.get("category")
-        address = item.get("roadAddress") or item.get("address")
-        item_lat = _safe_float(item.get("mapy"))
-        item_lng = _safe_float(item.get("mapx"))
-        phone = item.get("telephone")
+        address = item.get("road_address") or item.get("address")
+        item_lat = _safe_float(item.get("y") or item.get("lat"))
+        item_lng = _safe_float(item.get("x") or item.get("lng"))
+        phone = item.get("tel")
         place_url = item.get("link")
         distance_m = _extract_distance_m(item, lat, lng)
         if distance_m is not None and distance_m > radius_m:
