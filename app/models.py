@@ -294,7 +294,7 @@ class DailyActivity(Base):
         )
 
 
-class LocationProfile(Base)
+class LocationProfile(Base):
 
     """사용자별 집/회사 위치 프로필"""
     __tablename__ = "location_profiles"
@@ -343,7 +343,7 @@ class Restaurant(Base):
     )
 
     menu_items = relationship("MenuItem", back_populates="restaurant")
-    snapshots = relationship("RestaurantSnapshot", back_populates="restaurant")
+    restaurant_snapshots = relationship("RestaurantSnapshot", back_populates="restaurant")
 
     def __repr__(self):
         return f"<Restaurant(restaurant_id={self.restaurant_id}, name='{self.name}')>"

@@ -2546,17 +2546,17 @@ class FetchNutritionResponse(BaseModel):
 
 @app.post("/agent/nutrition/fetch", response_model=FetchNutritionResponse)
 def agent_fetch_nutrition(
-    payload: ,
+    payload: FetchNutritionRequest,
     db: Session = Depends(get_db),
 ):
-    from app.nodes.c_fetch_nutrition import c_fetch_nutrition
+    from app.nodes.c_fetch_nutrition import node_c_fetch_nutrition
 
-    nutrition_ids = c_fetch_nutrition(
-        db,
-        menu_item_ids=payload.menu_item_ids,
-        openai_model=payload.openai_model or "gpt-4.1-mini",
-        delay_s=payload.delay_s,
-    )
+    state = {
+        "menu_item_ids": payload.menu_item_ids,
+        "nutrition_delay_s": payload.delay_s,
+    }
+    result = node_c_fetch_nutrition(state)
+    nutrition_ids = result.get("nutrition_ids", [])
     return FetchNutritionResponse(nutrition_ids=nutrition_ids)
 
 @app.get("/api/debug/vector-store")

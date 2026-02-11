@@ -30,12 +30,12 @@
          │
          ▼
  ┌─────────────────────┐
- │  A_fetch_restaurants │  Naver Maps API로 반경 내 음식점 수집
+ │  A_fetch_restaurants │  Naver Maps Place Search API로 반경 내 음식점 수집
  └─────────┬───────────┘
            │ restaurants[]
            ▼
  ┌─────────────────────┐
- │   B_fetch_menus     │  음식점별 메뉴 수집 (웹 스크래핑)
+ │   B_fetch_menus     │  음식점별 메뉴 수집 (스크래핑 → LLM → Naver API 보정/검증)
  └─────────┬───────────┘
            │ menu_items[]
            ▼
@@ -77,7 +77,7 @@ app/
 
 **목적**: 주어진 주소 기준 반경 500m 내 음식점 리스트 수집
 
-**데이터 소스**: Naver Maps API (Local Search)
+**데이터 소스**: Naver Maps Place Search API
 
 
 **입력**:
@@ -94,33 +94,34 @@ app/
 **출력 State**:
 - `restaurant_ids: list[int]` — 수집된 음식점 ID 목록
 
-**Naver API 필드 매핑**:
+**Naver Maps Place Search 필드 매핑**:
 
 | Naver 응답 필드 | DB 컬럼 |
 |-----------------|---------|
-| `link` (또는 place id) | `source_place_id` |
-| `title` | `name` |
+| `id` | `source_place_id` |
+| `name` | `name` |
 | `category` | `category` |
-| `roadAddress` | `address_text` |
-| `mapy` | `lat` |
-| `mapx` | `lng` |
-| `telephone` | `phone` |
+| `road_address` | `address_text` |
+| `y` | `lat` |
+| `x` | `lng` |
+| `tel` | `phone` |
 | `link` | `place_url` |
 
 ### 3.2 Node B: `B_fetch_menus`
 
 **목적**: 수집된 음식점별 메뉴 정보 수집
 
-**데이터 소스**: 웹 스크래핑 (음식점 `place_url` 활용)
+**데이터 소스**: 1차 웹 스크래핑 → 실패 시 LLM 추론 → Naver API 보정/검증
 
 **입력**:
 - `restaurant_ids: list[int]` — Node A에서 전달받은 음식점 ID 목록
 
 **처리 흐름**:
 1. 각 restaurant의 `place_url` 접근하여 메뉴 정보 스크래핑
-2. 메뉴명, 가격, 설명 추출
-3. `menu_items` 테이블에 저장
-4. 스크래핑 실패 시 해당 음식점 skip (로그 기록)
+2. 스크래핑 실패 시 LLM으로 메뉴 정보 검색/추론
+3. 수집된 메뉴를 Naver API로 보정/검증 (가능한 경우)
+4. `menu_items` 테이블에 저장 (upsert)
+5. 스크래핑/LLM 모두 실패 시 해당 음식점 skip (로그 기록)
 
 **출력 State**:
 - `menu_item_ids: list[int]` — 수집된 메뉴 ID 목록
@@ -349,7 +350,7 @@ class AgentState(TypedDict):
 | Agent 프레임워크 | LangGraph |
 
 | LLM | openai API (영양정보 추론 fallback) |
-| 음식점 검색 | Kakao Local API |
+| 음식점 검색 | Naver Maps Place Search API |
 | 메뉴 수집 | 웹 스크래핑 (httpx + BeautifulSoup) |
 | 영양정보 검색 | 웹서치 API (Tavily / SerpAPI 등) |
 | ORM | SQLAlchemy |

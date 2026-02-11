@@ -1,11 +1,20 @@
+"""Node C: fetch nutrition facts for menu items."""
+
+from __future__ import annotations
+
 import json
 import time
-from typing import Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from sqlalchemy.orm import Session, joinedload
 
-from app.models import MenuItem, NutritionFact, Restaurant
-from app.services.nutrition_searcher import NutritionSearcher
+from app.database import SessionLocal
+from app.models import MenuItem, NutritionFacts, Restaurant
+import os
+
+from app.services.nutrition_searcher import infer_nutrition, search_nutrition
+
+State = Dict[str, Any]
 
 
 def _dedupe_preserve_order(values: Iterable[int]) -> List[int]:
@@ -19,19 +28,37 @@ def _dedupe_preserve_order(values: Iterable[int]) -> List[int]:
     return out
 
 
-def c_fetch_nutrition(
+def _save_nutrition(
     db: Session,
-    *,
-    menu_item_ids: List[int],
-    openai_model: str = "gpt-4.1-mini",
-    delay_s: float = 0.2,
-) -> List[int]:
-    """
-    Node C: 메뉴별 영양/칼로리 정보 수집 (웹서치 → LLM fallback)
-    - 입력이 비어있으면 빈 리스트 반환
-    - 이미 nutrition_facts가 존재하면 재사용
-    """
+    menu_item: MenuItem,
+    payload: Dict[str, Any],
+    source_type: str,
+    source_ref: Optional[str],
+    confidence: Optional[float],
+) -> NutritionFacts:
+    nf = NutritionFacts(
+        menu_item_id=menu_item.menu_id,
+        calories_kcal=payload.get("calories_kcal"),
+        carbs_g=payload.get("carbs_g"),
+        protein_g=payload.get("protein_g"),
+        fat_g=payload.get("fat_g"),
+        sodium_mg=payload.get("sodium_mg"),
+        sugar_g=payload.get("sugar_g"),
+        fiber_g=payload.get("fiber_g"),
+        source_type=source_type,
+        source_ref=source_ref,
+        confidence=confidence,
+    )
+    db.add(nf)
+    db.flush()
+    return nf
 
+
+def _collect_nutrition_for_items(
+    db: Session,
+    menu_item_ids: List[int],
+    delay_s: float,
+) -> List[int]:
     if not menu_item_ids:
         return []
 
@@ -39,88 +66,90 @@ def c_fetch_nutrition(
 
     items = (
         db.query(MenuItem)
-        .options(joinedload(MenuItem.restaurant), joinedload(MenuItem.nutrition_fact))
+        .options(joinedload(MenuItem.restaurant), joinedload(MenuItem.nutrition_facts))
         .filter(MenuItem.menu_id.in_(unique_ids))
         .all()
     )
     id_to_item: dict[int, MenuItem] = {m.menu_id: m for m in items}
 
-    searcher = NutritionSearcher(model=openai_model)
     nutrition_ids: List[int] = []
+
+    min_conf = float(os.getenv("NUTRITION_MIN_CONFIDENCE", "0.6"))
+    retry_count = int(os.getenv("NUTRITION_RETRY", "1"))
 
     for menu_id in unique_ids:
         menu_item = id_to_item.get(menu_id)
         if not menu_item:
             continue
 
-        if menu_item.nutrition_fact:
-            nutrition_ids.append(menu_item.nutrition_fact.nutrition_id)
+        if menu_item.nutrition_facts:
+            nutrition_ids.extend([nf.nutrition_id for nf in menu_item.nutrition_facts])
             continue
 
         restaurant: Optional[Restaurant] = getattr(menu_item, "restaurant", None)
 
         try:
-            result = searcher.search_or_infer(
-                restaurant_name=getattr(restaurant, "name", None),
-                restaurant_category=getattr(restaurant, "category", None),
-                menu_name=menu_item.name,
-                price_won=menu_item.price,
-                menu_description=menu_item.description,
-                menu_source_url=menu_item.source_url,
-            )
+            result = None
+            for _ in range(max(1, retry_count)):
+                result = search_nutrition(
+                    restaurant_name=getattr(restaurant, "name", ""),
+                    menu_name=menu_item.name,
+                )
+                if result and float(result.get("confidence") or 0) >= min_conf:
+                    break
+                result = None
 
-            source_ref = json.dumps(
-                {"refs": result.source_refs, "note": result.note},
-                ensure_ascii=False,
-            )
-
-            nf = NutritionFact(
-                menu_item_id=menu_item.menu_id,
-                calories_kcal=result.calories_kcal,
-                carbs_g=result.carbs_g,
-                protein_g=result.protein_g,
-                fat_g=result.fat_g,
-                sodium_mg=result.sodium_mg,
-                sugar_g=result.sugar_g,
-                fiber_g=result.fiber_g,
-                source_type=result.source_type,
-                source_ref=source_ref,
-                confidence=result.confidence,
-            )
-        except Exception as e:
-            nf = NutritionFact(
-                menu_item_id=menu_item.menu_id,
+            if result:
+                source_ref = json.dumps({"refs": result.get("refs")}, ensure_ascii=False)
+                nf = _save_nutrition(
+                    db,
+                    menu_item,
+                    result,
+                    source_type="search",
+                    source_ref=source_ref,
+                    confidence=result.get("confidence"),
+                )
+            else:
+                inferred = None
+                for _ in range(max(1, retry_count)):
+                    inferred = infer_nutrition(
+                        restaurant_name=getattr(restaurant, "name", ""),
+                        category=getattr(restaurant, "category", ""),
+                        menu_name=menu_item.name,
+                        price=menu_item.price,
+                    )
+                    if inferred and inferred.get("confidence") is not None:
+                        break
+                inferred = inferred or {}
+                source_ref = json.dumps({"note": "llm_infer"}, ensure_ascii=False)
+                nf = _save_nutrition(
+                    db,
+                    menu_item,
+                    inferred,
+                    source_type="infer",
+                    source_ref=source_ref,
+                    confidence=inferred.get("confidence"),
+                )
+        except Exception as exc:  # noqa: BLE001
+            nf = _save_nutrition(
+                db,
+                menu_item,
+                {},
                 source_type="infer",
-                source_ref=json.dumps({"error": str(e)}, ensure_ascii=False),
+                source_ref=json.dumps({"error": str(exc)}, ensure_ascii=False),
                 confidence=0.0,
             )
 
-        db.add(nf)
-        db.flush()
         nutrition_ids.append(nf.nutrition_id)
-
         if delay_s > 0:
             time.sleep(delay_s)
 
     db.commit()
     return nutrition_ids
 
-=======
-"""Node C: fetch nutrition facts for menu items.
-
-Stub implementation to be expanded by a dedicated agent.
-"""
-
-from __future__ import annotations
-
-from typing import Dict, Any
-
-
-State = Dict[str, Any]
-
 
 def node_c_fetch_nutrition(state: State) -> State:
-    """C: 메뉴별 영양/칼로리 추출 (추후 에이전트 구현)
+    """C: 메뉴별 영양/칼로리 추출
 
     Expected input in state:
     - menu_item_ids: list[int]
@@ -128,7 +157,19 @@ def node_c_fetch_nutrition(state: State) -> State:
     Expected output in state:
     - nutrition_ids: list[int]
     """
-    state.setdefault("nutrition_ids", [])
+    menu_item_ids: List[int] = state.get("menu_item_ids", []) or []
+    if not menu_item_ids:
+        state.setdefault("nutrition_ids", [])
+        return state
+
+    delay_s = float(state.get("nutrition_delay_s", 0.2))
+
+    db: Session = SessionLocal()
+    try:
+        nutrition_ids = _collect_nutrition_for_items(db, menu_item_ids, delay_s)
+        state["nutrition_ids"] = nutrition_ids
+    finally:
+        db.close()
     return state
 
 

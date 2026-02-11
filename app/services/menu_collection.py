@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
@@ -68,17 +69,35 @@ def collect_menus_for_restaurant(
     method_priority: List[str],
     llm_fallback: bool,
     naver_validation: bool,
+    *,
+    retry_count: Optional[int] = None,
+    min_items: Optional[int] = None,
 ) -> List[MenuItem]:
     menus: List[Dict[str, object]] = []
+    retry_count = retry_count if retry_count is not None else int(os.getenv("MENU_COLLECTION_RETRY", "1"))
+    min_items = min_items if min_items is not None else int(os.getenv("MENU_MIN_ITEMS", "1"))
+    use_naver_place = os.getenv("MENU_USE_NAVER_PLACE", "true").lower() == "true"
+
+    def attempt(fn, source: str) -> List[Dict[str, object]]:
+        for _ in range(max(1, retry_count)):
+            result = normalize_menus(fn(), source)
+            if len(result) >= min_items:
+                return result
+        return []
+
+    if use_naver_place:
+        # Always try Naver place URL resolution + scraping first
+        menus = attempt(lambda: fetch_menus(restaurant.name, restaurant.address_text), "API")
 
     if "SCRAPING" in method_priority and restaurant.place_url:
-        menus = normalize_menus(scrape_menus(restaurant.place_url), "SCRAPING")
+        if not menus:
+            menus = attempt(lambda: scrape_menus(restaurant.place_url), "SCRAPING")
 
     if not menus and llm_fallback and "LLM" in method_priority:
-        menus = normalize_menus(infer_menus(restaurant.name, restaurant.address_text), "LLM")
+        menus = attempt(lambda: infer_menus(restaurant.name, restaurant.address_text), "LLM")
 
     if not menus and "API" in method_priority:
-        menus = normalize_menus(fetch_menus(restaurant.name, restaurant.address_text), "API")
+        menus = attempt(lambda: fetch_menus(restaurant.name, restaurant.address_text), "API")
 
     if menus and naver_validation:
         menus = normalize_menus(
@@ -110,6 +129,9 @@ def collect_menus_for_restaurants(
     method_priority: List[str],
     llm_fallback: bool,
     naver_validation: bool,
+    *,
+    retry_count: Optional[int] = None,
+    min_items: Optional[int] = None,
 ) -> Tuple[List[int], List[Dict[str, str]]]:
     menu_item_ids: List[int] = []
     failures: List[Dict[str, str]] = []
@@ -133,7 +155,13 @@ def collect_menus_for_restaurants(
 
         try:
             items = collect_menus_for_restaurant(
-                db, restaurant, method_priority, llm_fallback, naver_validation
+                db,
+                restaurant,
+                method_priority,
+                llm_fallback,
+                naver_validation,
+                retry_count=retry_count,
+                min_items=min_items,
             )
         except Exception as exc:  # noqa: BLE001
             failures.append(

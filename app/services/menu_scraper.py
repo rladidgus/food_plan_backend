@@ -32,8 +32,11 @@ def scrape_menus(place_url: str) -> List[Dict[str, Any]]:
         return []
 
     menus: List[Dict[str, Any]] = []
-    for raw in _extract_jsonld(html):
-        menus.extend(_extract_menus_from_jsonld(raw))
+    if "place.naver.com" in place_url:
+        menus.extend(_extract_menus_from_naver(html))
+    if not menus:
+        for raw in _extract_jsonld(html):
+            menus.extend(_extract_menus_from_jsonld(raw))
     return menus
 
 
@@ -87,6 +90,101 @@ def _extract_menus_from_jsonld(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     walk(payload)
     return menus
+
+
+def _extract_menus_from_naver(html: str) -> List[Dict[str, Any]]:
+    menus: List[Dict[str, Any]] = []
+    menus.extend(_extract_from_next_data(html))
+    menus.extend(_extract_from_apollo_state(html))
+    # 마지막으로 일반 파서로 한번 더
+    if not menus:
+        menus.extend(_extract_menus_generic_json(html))
+    return _dedupe_menus(menus)
+
+
+def _extract_from_next_data(html: str) -> List[Dict[str, Any]]:
+    pattern = re.compile(
+        r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    match = pattern.search(html)
+    if not match:
+        return []
+    text = match.group(1).strip()
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    return _find_menu_candidates(payload)
+
+
+def _extract_from_apollo_state(html: str) -> List[Dict[str, Any]]:
+    pattern = re.compile(r"__APOLLO_STATE__\s*=\s*(\{.*?\})\s*;\s*", re.DOTALL)
+    match = pattern.search(html)
+    if not match:
+        return []
+    raw = match.group(1)
+    try:
+        raw = raw.replace("undefined", "null")
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    return _find_menu_candidates(payload)
+
+
+def _extract_menus_generic_json(html: str) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    for raw in _extract_jsonld(html):
+        candidates.extend(_extract_menus_from_jsonld(raw))
+    return candidates
+
+
+def _find_menu_candidates(payload: Any) -> List[Dict[str, Any]]:
+    menus: List[Dict[str, Any]] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            if _looks_like_menu(node):
+                menus.append(
+                    {
+                        "name": node.get("name") or node.get("menuName"),
+                        "description": node.get("description") or node.get("desc"),
+                        "price": node.get("price") or node.get("priceInfo"),
+                        "source_url": None,
+                    }
+                )
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(payload)
+    return menus
+
+
+def _looks_like_menu(node: Dict[str, Any]) -> bool:
+    name = node.get("name") or node.get("menuName")
+    if not isinstance(name, str) or not name.strip():
+        return False
+    if "price" in node or "priceInfo" in node:
+        return True
+    if "description" in node or "desc" in node:
+        return True
+    return False
+
+
+def _dedupe_menus(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen: set[str] = set()
+    out: List[Dict[str, Any]] = []
+    for item in items:
+        name = str(item.get("name") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(item)
+    return out
 
 
 def _menu_from_menuitem(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
