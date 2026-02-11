@@ -28,14 +28,6 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from supabase import create_client, Client
 import requests
 from app.meal_plan_ai import MealPlanItem, DayMealPlan, OneDayMealPlan, generate_one_day_plan
-from app.vector_store import (
-    upsert_meal_record,
-    delete_meal_record,
-    delete_meal_records_bulk,
-    search_user_preferred_meals,
-    get_collection,
-    migrate_existing_records,
-)
 from app.api.menus import router as menus_router
 
 # Supabase 클라이언트 초기화
@@ -181,6 +173,7 @@ class DietPlan3DaysRequest(BaseModel):
     id: Optional[str] = None
     goal_type: Optional[str] = None
     target_calorie: Optional[float] = None
+    preferred_foods: Optional[List[str]] = None  # 추가: 사용자가 좋아하는 음식 목록
 
 
 class DietPlanContextRequest(BaseModel):
@@ -369,26 +362,6 @@ def startup_event():
     Base.metadata.create_all(bind=engine)
     print("✅ 데이터베이스 초기화 완료")
 
-    # ChromaDB 초기화
-    try:
-        collection = get_collection()
-        count = collection.count()
-        print(f"✅ ChromaDB 초기화 완료 (벡터 수: {count})")
-
-        # 기존 record 데이터가 있는데 ChromaDB가 비어있으면 마이그레이션
-        if count == 0:
-            from app.database import SessionLocal
-            db = SessionLocal()
-            try:
-                record_count = db.query(models.Record).count()
-                if record_count > 0:
-                    print(f"📦 기존 식단 기록 {record_count}건을 ChromaDB로 마이그레이션 중...")
-                    migrated = migrate_existing_records(db)
-                    print(f"✅ ChromaDB 마이그레이션 완료: {migrated}건")
-            finally:
-                db.close()
-    except Exception as e:
-        print(f"⚠️ ChromaDB 초기화 실패 (서버는 계속 실행됩니다): {e}")
 
 @app.get("/")
 def root():
@@ -1031,15 +1004,7 @@ def upsert_user_goal(
         profile.goal_type = goal_type
 
     # ChromaDB에서 사용자 선호 음식 검색
-    preferred_meals = []
-    try:
-        preferred_meals = search_user_preferred_meals(
-            user_number=user.user_number,
-            goal_type=goal_type,
-            target_calorie=float(target_calorie) if target_calorie else 2000.0,
-        )
-    except Exception as e:
-        logger.warning("벡터 검색 실패 (무시하고 계속 진행): %s", e)
+
 
     prompt = {
         "goal_type": goal_type,
@@ -1067,7 +1032,7 @@ def upsert_user_goal(
     }
 
     try:
-        plan = generate_one_day_plan(prompt, preferred_meals=preferred_meals)
+        plan = generate_one_day_plan(prompt, preferred_foods=[])
     except Exception as exc:
         raise HTTPException(
             status_code=500,
@@ -1208,17 +1173,6 @@ def generate_1day_diet_plan(
                 normalize_activity_level(profile.activity_level) if profile else None,
             )
 
-    # ChromaDB에서 사용자 선호 음식 검색
-    preferred_meals = []
-    try:
-        preferred_meals = search_user_preferred_meals(
-            user_number=user.user_number,
-            goal_type=goal_type,
-            target_calorie=float(target_calorie) if target_calorie else 2000.0,
-        )
-    except Exception as e:
-        logger.warning("벡터 검색 실패 (무시하고 계속 진행): %s", e)
-
     prompt = {
         "goal_type": goal_type,
         "target_calorie": round(float(target_calorie)) if target_calorie else None,
@@ -1245,7 +1199,10 @@ def generate_1day_diet_plan(
     }
 
     try:
-        plan = generate_one_day_plan(prompt, preferred_meals=preferred_meals)
+        plan = generate_one_day_plan(
+            prompt, 
+            preferred_foods=payload.preferred_foods or []
+        )
     except Exception as exc:
         raise HTTPException(
             status_code=500,
@@ -1374,36 +1331,7 @@ def generate_context_aware_diet_plan(
             )
 
     # ChromaDB에서 사용자 선호 음식 검색
-    preferred_meals = []
-    try:
-        context_str = context.strip()
-        breakfast_meals = search_user_preferred_meals(
-            user_number=user.user_number,
-            goal_type=goal_type,
-            target_calorie=float(target_calorie) if target_calorie else 2000.0,
-            meal_type="breakfast",
-            context=context_str,
-            n_results=3,
-        )
-        lunch_meals = search_user_preferred_meals(
-            user_number=user.user_number,
-            goal_type=goal_type,
-            target_calorie=float(target_calorie) if target_calorie else 2000.0,
-            meal_type="lunch",
-            context=context_str,
-            n_results=3,
-        )
-        dinner_meals = search_user_preferred_meals(
-            user_number=user.user_number,
-            goal_type=goal_type,
-            target_calorie=float(target_calorie) if target_calorie else 2000.0,
-            meal_type="dinner",
-            context=context_str,
-            n_results=3,
-        )
-        preferred_meals = breakfast_meals + lunch_meals + dinner_meals
-    except Exception as e:
-        logger.warning("벡터 검색 실패 (무시하고 계속 진행): %s", e)
+
 
     prompt = {
         "goal_type": goal_type,
@@ -1433,7 +1361,11 @@ def generate_context_aware_diet_plan(
     }
 
     try:
-        plan = generate_one_day_plan(prompt, preferred_meals=preferred_meals)
+        # preferred_foods를 직접 전달
+        plan = generate_one_day_plan(
+            prompt, 
+            preferred_foods=payload.preferred_foods or []
+        )
     except Exception as exc:
         raise HTTPException(
             status_code=500,
@@ -1617,20 +1549,7 @@ def create_records_from_plan(
         db.flush()
         record_ids.append(rec.record_id)
 
-        # ChromaDB에 벡터 저장
-        try:
-            upsert_meal_record(
-                record_id=rec.record_id,
-                user_number=user.user_number,
-                food_name=meal.name.strip(),
-                meal_type=meal_type,
-                calories=float(meal.calories_kcal),
-                protein=float(meal.protein_g),
-                carb=float(meal.carbs_g),
-                fat=float(meal.fat_g),
-            )
-        except Exception as e:
-            logger.warning("ChromaDB 저장 실패 (무시): %s", e)
+
 
     db.commit()
     return {"record_ids": record_ids}
@@ -2339,12 +2258,7 @@ def delete_day_records(
 
     db.commit()
 
-    # ChromaDB에서도 벌크 삭제
-    if record_ids:
-        try:
-            delete_meal_records_bulk(record_ids)
-        except Exception as e:
-            logger.warning("ChromaDB 벌크 삭제 실패 (무시): %s", e)
+
 
     return
     
@@ -2368,11 +2282,7 @@ def delete_record(
     db.delete(record)
     db.commit()
 
-    # ChromaDB에서도 삭제
-    try:
-        delete_meal_record(record_id)
-    except Exception as e:
-        logger.warning("ChromaDB 삭제 실패 (무시): %s", e)
+
 
     return {"record_id": record_id, "message": "식단 기록이 삭제되었습니다."}
 
@@ -2546,7 +2456,7 @@ class FetchNutritionResponse(BaseModel):
 
 @app.post("/agent/nutrition/fetch", response_model=FetchNutritionResponse)
 def agent_fetch_nutrition(
-    payload: ,
+    payload: FetchNutritionRequest,
     db: Session = Depends(get_db),
 ):
     from app.nodes.c_fetch_nutrition import c_fetch_nutrition
@@ -2558,22 +2468,6 @@ def agent_fetch_nutrition(
         delay_s=payload.delay_s,
     )
     return FetchNutritionResponse(nutrition_ids=nutrition_ids)
-
-@app.get("/api/debug/vector-store")
-def debug_vector_store_peek(limit: int = 10):
-    """(임시) ChromaDB 데이터 확인용 엔드포인트"""
-    try:
-        collection = get_collection()
-        count = collection.count()
-        items = collection.peek(limit=limit)
-        return {
-            "message": "ChromaDB 'user_meal_records' collection",
-            "count": count,
-            "items": items
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 
 if __name__ == "__main__":
     import uvicorn

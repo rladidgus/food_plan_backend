@@ -46,41 +46,35 @@ if not OPENAI_API_KEY:
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 
-def _build_preference_text(preferred_meals: List[Dict[str, Any]]) -> str:
-    """벡터 검색 결과를 GPT 프롬프트용 텍스트로 변환"""
-    if not preferred_meals:
+def _build_preference_text(preferred_foods: List[str]) -> str:
+    """사용자가 직접 입력한 선호 음식을 GPT 프롬프트용 텍스트로 변환"""
+    if not preferred_foods:
         return ""
 
-    # 중복 음식명 제거 (순서 유지)
-    seen = set()
-    unique_foods = []
-    for m in preferred_meals:
-        name = m.get("food_name", "")
-        if name and name not in seen:
-            seen.add(name)
-            unique_foods.append(name)
-
+    # 중복 제거 및 리스트 정리
+    unique_foods = list(dict.fromkeys([f.strip() for f in preferred_foods if f.strip()]))
+    
     if not unique_foods:
         return ""
 
     return (
-        "\n\n## 사용자 식단 이력 (선호 음식)\n"
-        f"이 사용자가 과거에 자주 먹은 음식: {', '.join(unique_foods)}\n"
-        "- 위 음식들을 참고하여 사용자 취향에 맞는 식단을 구성해라.\n"
-        "- 동일한 음식을 그대로 반복하지 말고, 비슷한 계열의 다양한 음식을 추천해라.\n"
-        "- 사용자가 좋아하는 맛/재료/조리 스타일을 반영해라.\n"
+        "\n\n## 사용자 선호 음식 및 요청 사항\n"
+        f"사용자가 다음과 같은 음식을 식단에 포함시키길 원함: {', '.join(unique_foods)}\n"
+        "- 위 음식들을 최대한 활용하여 식단을 구성해라.\n"
+        "- 다만, 목표 칼로리와 영양 밸런스를 해치지 않는 선에서 조리법이나 양을 조절해서 포함시켜라.\n"
+        "- (예: '치킨'을 원하면 '튀긴 치킨' 대신 '오븐 구이 치킨'이나 '닭가슴살 샐러드' 등으로 건강하게 변형 가능)\n"
     )
 
 
 def generate_one_day_plan(
     prompt: dict,
-    preferred_meals: Optional[List[Dict[str, Any]]] = None,
+    preferred_foods: Optional[List[str]] = None,
 ) -> OneDayMealPlan:
     """
     1일 식단 생성.
-    preferred_meals: 벡터 검색으로 가져온 사용자 선호 음식 목록 (없으면 무시)
+    preferred_foods: 사용자가 직접 입력한 선호 음식 목록 (문자열 리스트)
     """
-    preference_text = _build_preference_text(preferred_meals or [])
+    preference_text = _build_preference_text(preferred_foods or [])
 
     user_content = (
         "다음 정보를 바탕으로 1일치 식단을 추천해줘. "
