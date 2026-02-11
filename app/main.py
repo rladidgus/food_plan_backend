@@ -28,15 +28,13 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from supabase import create_client, Client
 import requests
 from app.meal_plan_ai import MealPlanItem, DayMealPlan, OneDayMealPlan, generate_one_day_plan
-from app.vector_store import (
-    upsert_meal_record,
-    delete_meal_record,
-    delete_meal_records_bulk,
-    search_user_preferred_meals,
-    get_collection,
-    migrate_existing_records,
+from app.agent_graph import build_graph
+from app.schemas import (
+    FetchNutritionRequest,
+    FetchNutritionResponse,
+    NodeRunRequest,
+    NodeRunResponse,
 )
-from app.api.menus import router as menus_router
 
 # Supabase 클라이언트 초기화
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -91,9 +89,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-app.include_router(menus_router, prefix="/api/v1", tags=["menus"])
-
 
 # Pydantic 모델 (요청/응답 스키마)
 class DietRecordRequest(BaseModel):
@@ -363,32 +358,11 @@ class BodyTypeFromUserRequest(BaseModel):
 # DB 테이블 생성
 @app.on_event("startup")
 def startup_event():
-    """애플리케이션 시작 시 DB 테이블 생성 & ChromaDB 초기화"""
+    """애플리케이션 시작 시 DB 테이블 생성"""
     print("🚀 FastAPI 서버 시작 중...")
     time_module.sleep(3)  # DB가 준비될 때까지 대기
     Base.metadata.create_all(bind=engine)
     print("✅ 데이터베이스 초기화 완료")
-
-    # ChromaDB 초기화
-    try:
-        collection = get_collection()
-        count = collection.count()
-        print(f"✅ ChromaDB 초기화 완료 (벡터 수: {count})")
-
-        # 기존 record 데이터가 있는데 ChromaDB가 비어있으면 마이그레이션
-        if count == 0:
-            from app.database import SessionLocal
-            db = SessionLocal()
-            try:
-                record_count = db.query(models.Record).count()
-                if record_count > 0:
-                    print(f"📦 기존 식단 기록 {record_count}건을 ChromaDB로 마이그레이션 중...")
-                    migrated = migrate_existing_records(db)
-                    print(f"✅ ChromaDB 마이그레이션 완료: {migrated}건")
-            finally:
-                db.close()
-    except Exception as e:
-        print(f"⚠️ ChromaDB 초기화 실패 (서버는 계속 실행됩니다): {e}")
 
 @app.get("/")
 def root():
@@ -1030,16 +1004,7 @@ def upsert_user_goal(
     if profile:
         profile.goal_type = goal_type
 
-    # ChromaDB에서 사용자 선호 음식 검색
     preferred_meals = []
-    try:
-        preferred_meals = search_user_preferred_meals(
-            user_number=user.user_number,
-            goal_type=goal_type,
-            target_calorie=float(target_calorie) if target_calorie else 2000.0,
-        )
-    except Exception as e:
-        logger.warning("벡터 검색 실패 (무시하고 계속 진행): %s", e)
 
     prompt = {
         "goal_type": goal_type,
@@ -1208,16 +1173,7 @@ def generate_1day_diet_plan(
                 normalize_activity_level(profile.activity_level) if profile else None,
             )
 
-    # ChromaDB에서 사용자 선호 음식 검색
     preferred_meals = []
-    try:
-        preferred_meals = search_user_preferred_meals(
-            user_number=user.user_number,
-            goal_type=goal_type,
-            target_calorie=float(target_calorie) if target_calorie else 2000.0,
-        )
-    except Exception as e:
-        logger.warning("벡터 검색 실패 (무시하고 계속 진행): %s", e)
 
     prompt = {
         "goal_type": goal_type,
@@ -1373,37 +1329,7 @@ def generate_context_aware_diet_plan(
                 normalize_activity_level(profile.activity_level) if profile else None,
             )
 
-    # ChromaDB에서 사용자 선호 음식 검색
     preferred_meals = []
-    try:
-        context_str = context.strip()
-        breakfast_meals = search_user_preferred_meals(
-            user_number=user.user_number,
-            goal_type=goal_type,
-            target_calorie=float(target_calorie) if target_calorie else 2000.0,
-            meal_type="breakfast",
-            context=context_str,
-            n_results=3,
-        )
-        lunch_meals = search_user_preferred_meals(
-            user_number=user.user_number,
-            goal_type=goal_type,
-            target_calorie=float(target_calorie) if target_calorie else 2000.0,
-            meal_type="lunch",
-            context=context_str,
-            n_results=3,
-        )
-        dinner_meals = search_user_preferred_meals(
-            user_number=user.user_number,
-            goal_type=goal_type,
-            target_calorie=float(target_calorie) if target_calorie else 2000.0,
-            meal_type="dinner",
-            context=context_str,
-            n_results=3,
-        )
-        preferred_meals = breakfast_meals + lunch_meals + dinner_meals
-    except Exception as e:
-        logger.warning("벡터 검색 실패 (무시하고 계속 진행): %s", e)
 
     prompt = {
         "goal_type": goal_type,
@@ -1616,21 +1542,6 @@ def create_records_from_plan(
         db.add(rec)
         db.flush()
         record_ids.append(rec.record_id)
-
-        # ChromaDB에 벡터 저장
-        try:
-            upsert_meal_record(
-                record_id=rec.record_id,
-                user_number=user.user_number,
-                food_name=meal.name.strip(),
-                meal_type=meal_type,
-                calories=float(meal.calories_kcal),
-                protein=float(meal.protein_g),
-                carb=float(meal.carbs_g),
-                fat=float(meal.fat_g),
-            )
-        except Exception as e:
-            logger.warning("ChromaDB 저장 실패 (무시): %s", e)
 
     db.commit()
     return {"record_ids": record_ids}
@@ -2323,14 +2234,6 @@ def delete_day_records(
     start = day
     end = day + timedelta(days=1)
 
-    # 삭제 전에 record_id 목록을 조회 (ChromaDB 동기화용)
-    records_to_delete = db.query(Record.record_id).filter(
-        Record.user_number == current_user.user_number,
-        Record.record_created_at >= start,
-        Record.record_created_at < end,
-    ).all()
-    record_ids = [r.record_id for r in records_to_delete]
-
     db.query(Record).filter(
         Record.user_number == current_user.user_number,
         Record.record_created_at >= start,
@@ -2338,13 +2241,6 @@ def delete_day_records(
     ).delete(synchronize_session=False)
 
     db.commit()
-
-    # ChromaDB에서도 벌크 삭제
-    if record_ids:
-        try:
-            delete_meal_records_bulk(record_ids)
-        except Exception as e:
-            logger.warning("ChromaDB 벌크 삭제 실패 (무시): %s", e)
 
     return
     
@@ -2367,12 +2263,6 @@ def delete_record(
 
     db.delete(record)
     db.commit()
-
-    # ChromaDB에서도 삭제
-    try:
-        delete_meal_record(record_id)
-    except Exception as e:
-        logger.warning("ChromaDB 삭제 실패 (무시): %s", e)
 
     return {"record_id": record_id, "message": "식단 기록이 삭제되었습니다."}
 
@@ -2440,21 +2330,6 @@ async def vision_food(
         db.add(rec)
         db.commit()
         db.refresh(rec)
-
-        # ChromaDB에 벡터 저장
-        try:
-            upsert_meal_record(
-                record_id=rec.record_id,
-                user_number=user_number,
-                food_name=decision["chosen_food"],
-                meal_type=meal_type,
-                calories=float(nutrition.get("calories_kcal") or 0),
-                protein=float(nutrition.get("protein_g") or 0),
-                carb=float(nutrition.get("carbs_g") or 0),
-                fat=float(nutrition.get("fat_g") or 0),
-            )
-        except Exception as e:
-            logger.warning("ChromaDB 저장 실패 (무시): %s", e)
 
         return {
             "far_id": far.far_id,
@@ -2533,46 +2408,34 @@ def classify_by_user(
     db.commit()
     return result
 
-
-class FetchNutritionRequest(BaseModel):
-    menu_item_ids: List[int]
-    openai_model: Optional[str] = "gpt-4.1-mini"
-    delay_s: float = 0.2
-
-
-class FetchNutritionResponse(BaseModel):
-    nutrition_ids: List[int]
-
-
-@app.post("/agent/nutrition/fetch", response_model=FetchNutritionResponse)
-def agent_fetch_nutrition(
-    payload: FetchNutritionRequest,
-    db: Session = Depends(get_db),
+@app.post("/api/node/run", response_model=NodeRunResponse)
+def run_node_pipeline(
+    payload: NodeRunRequest,
+    current_user: User = Depends(get_current_user_from_token),
 ):
-    from app.nodes.c_fetch_nutrition import node_c_fetch_nutrition
+    if (payload.lat is None or payload.lng is None) and not (payload.address_text and payload.address_text.strip()):
+        raise HTTPException(status_code=400, detail="lat/lng 또는 address_text 중 하나는 필수입니다.")
 
+    graph = build_graph()
     state = {
-        "menu_item_ids": payload.menu_item_ids,
-        "nutrition_delay_s": payload.delay_s,
+        "user_number": current_user.user_number,
+        "label": "current",
+        "address_text": (payload.address_text or "").strip(),
+        "lat": payload.lat,
+        "lng": payload.lng,
+        "radius_m": payload.radius_m or 500,
+        "errors": [],
     }
-    result = node_c_fetch_nutrition(state)
-    nutrition_ids = result.get("nutrition_ids", [])
-    return FetchNutritionResponse(nutrition_ids=nutrition_ids)
-
-@app.get("/api/debug/vector-store")
-def debug_vector_store_peek(limit: int = 10):
-    """(임시) ChromaDB 데이터 확인용 엔드포인트"""
-    try:
-        collection = get_collection()
-        count = collection.count()
-        items = collection.peek(limit=limit)
-        return {
-            "message": "ChromaDB 'user_meal_records' collection",
-            "count": count,
-            "items": items
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    result = graph.invoke(state)
+    return NodeRunResponse(
+        user_number=current_user.user_number,
+        label=(result.get("label") or "current"),
+        location_profile_id=result.get("location_profile_id"),
+        restaurant_ids=result.get("restaurant_ids", []) or [],
+        menu_item_ids=result.get("menu_item_ids", []) or [],
+        nutrition_ids=result.get("nutrition_ids", []) or [],
+        errors=result.get("errors", []) or [],
+    )
 
 
 if __name__ == "__main__":
