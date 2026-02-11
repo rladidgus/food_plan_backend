@@ -6,19 +6,18 @@ Node implementations are placeholders and should be expanded by individual agent
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import List
 
 from langgraph.graph import StateGraph
 
-from app.nodes.a_fetch_restaurants import node_a_fetch_restaurants
-from app.nodes.b_fetch_menus import node_b_fetch_menus
-from app.nodes.c_fetch_nutrition import node_c_fetch_nutrition
-
-State = Dict[str, Any]
+from app.node.a_fetch_restaurants import node_a_fetch_restaurants
+from app.node.b_fetch_menus import node_b_fetch_menus
+from app.node.c_fetch_nutrition import node_c_fetch_nutrition
+from app.schemas import AgentState
 
 
 def build_graph():
-    graph = StateGraph(dict)
+    graph = StateGraph(AgentState)
 
     graph.add_node("A_fetch_restaurants", node_a_fetch_restaurants)
     graph.add_node("B_fetch_menus", node_b_fetch_menus)

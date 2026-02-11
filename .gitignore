@@ -22,5 +22,5 @@ chroma_data/
 # uploads (runtime-generated)
 uploads/
 # local env files
-.env.local
+.env
 .env.prod

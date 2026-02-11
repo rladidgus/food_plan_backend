@@ -5,7 +5,7 @@
 
 ### 1.1 핵심 수집 전략
 * **스냅샷 관리**: 동일 음식점이 여러 위치에서 발견되어도 마스터 정보는 하나만 유지하고, `restaurant_snapshots` 테이블을 통해 관계와 거리를 개별 관리합니다.
-* **하이브리드 정보 수집**: 위치는 **지도 API(Kakao/Naver)**로, 메뉴와 영양 정보는 **Tavily API + LLM** 조합으로 수집하여 크롤링의 한계를 극복합니다.
+* **하이브리드 정보 수집**: 위치는 **지도 API(Kakao)**로, 메뉴와 영양 정보는 **Tavily API + LLM** 조합으로 수집하여 크롤링의 한계를 극복합니다.
 * **데이터 분리**: 사용자별, 위치별(home/work)로 데이터를 독립적으로 조회할 수 있도록 설계합니다.
 
 ---
@@ -62,7 +62,7 @@
 ## 5. 기술 스택
 
 * **프레임워크**: LangGraph (에이전트 제어)
-* **API**: Kakao/Naver Maps (위치), Tavily (AI 검색), OpenAI (데이터 파싱)
+* **API**: Kakao Maps (위치), Tavily (AI 검색), OpenAI (데이터 파싱)
 * **데이터베이스**: PostgreSQL (SQLAlchemy ORM)
 * **환경**: Docker / WSL (Ubuntu-20.04)
 
