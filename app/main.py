@@ -2,6 +2,7 @@ import os
 import json
 import traceback
 import time
+import asyncio
 import logging
 import time as time_module
 import re
@@ -29,6 +30,11 @@ from app.models import (
     UserGoal,
     DailyActivity,
     UserDietPlan,
+    LocationProfile,
+    Restaurant,
+    RestaurantSnapshot,
+    MenuItem,
+    NutritionFacts,
 )
 from app.goal_rules import estimate_target_calorie, normalize_activity_level, ACTIVITY_FACTORS, infer_goal_type
 from app.schemas import (
@@ -36,6 +42,8 @@ from app.schemas import (
     AuthResponse,
     BodyTypeFromUserRequest,
     CalendarMarkedDatesResponse,
+    CollectorRunRequest,
+    CollectorRunResponse,
     DailyActivityIn,
     DailyActivityUpsertResult,
     DietPlan3DaysRequest,
@@ -54,6 +62,9 @@ from app.schemas import (
     PlanMealRecordIn,
     PlanRecordCreateRequest,
     PlanRecordCreateResult,
+    PersonalizedMenuItem,
+    PersonalizedMenuRequest,
+    PersonalizedMenuResponse,
     RecordDeleteResponse,
     SocialCheckRequest,
     SocialCheckResponse,
@@ -67,6 +78,10 @@ from app.schemas import (
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from supabase import create_client, Client
 import requests
+try:
+    from openai import OpenAI
+except ModuleNotFoundError:
+    OpenAI = None
 try:
     from app.meal_plan_ai import MealPlanItem, DayMealPlan, OneDayMealPlan, generate_one_day_plan
 except ModuleNotFoundError:
@@ -101,6 +116,12 @@ _pexels_cache: dict[str, Optional[str]] = {}
 KAKAO_REST_API_KEY = os.getenv("KAKAO_REST_API_KEY")
 KAKAO_LOCAL_CATEGORY_API_URL = "https://dapi.kakao.com/v2/local/search/category.json"
 KAKAO_LOCAL_KEYWORD_API_URL = "https://dapi.kakao.com/v2/local/search/keyword.json"
+KAKAO_LOCAL_ADDRESS_API_URL = "https://dapi.kakao.com/v2/local/search/address.json"
+SERPER_API_KEY = os.getenv("SERPER_API_KEY")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OpenAI and OPENAI_API_KEY else None
 
 # 환경 변수에서 DB 정보 가져오기
 DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -205,6 +226,169 @@ def _normalize_goal_type(value: Optional[str]) -> Optional[str]:
         "증량": "bulk",
     }
     return goal_type_map.get(raw, raw)
+
+
+def _resolve_goal_type_for_user(db: Session, user_number: int) -> str:
+    latest_goal = (
+        db.query(UserGoal)
+        .filter(UserGoal.user_number == user_number)
+        .order_by(UserGoal.created_at.desc())
+        .first()
+    )
+    if latest_goal and latest_goal.goal_type:
+        normalized = _normalize_goal_type(latest_goal.goal_type)
+        if normalized in {"diet", "maintain", "bulk"}:
+            return normalized
+
+    profile = db.query(UserProfile).filter(UserProfile.user_number == user_number).first()
+    if profile and profile.goal_type:
+        normalized = _normalize_goal_type(profile.goal_type)
+        if normalized in {"diet", "maintain", "bulk"}:
+            return normalized
+
+    return "maintain"
+
+
+def _resolve_tdee_kcal_for_user(db: Session, user: User) -> int:
+    profile = db.query(UserProfile).filter(UserProfile.user_number == user.user_number).first()
+    latest_inbody = (
+        db.query(InBodyRecord)
+        .filter(InBodyRecord.user_number == user.user_number)
+        .order_by(InBodyRecord.created_at.desc())
+        .first()
+    )
+
+    bmr = latest_inbody.bmr if latest_inbody and latest_inbody.bmr else None
+    weight = latest_inbody.weight if latest_inbody and latest_inbody.weight else None
+    if weight is None and profile and profile.weight:
+        weight = profile.weight
+
+    if bmr is None:
+        # Fallback rule in PRD: 인바디 미입력 시 표준값 사용
+        fallback_weight = float(weight) if weight is not None else 70.0
+        bmr = 24.0 * fallback_weight
+
+    activity_level = normalize_activity_level(profile.activity_level) if profile else "moderate"
+    factor = ACTIVITY_FACTORS.get(activity_level or "moderate", ACTIVITY_FACTORS["moderate"])
+    return int(round(float(bmr) * float(factor)))
+
+
+def _goal_daily_target_kcal(tdee_kcal: int, goal_type: str) -> int:
+    if goal_type == "diet":
+        return max(1200, tdee_kcal - 400)
+    if goal_type == "bulk":
+        return tdee_kcal + 400
+    return tdee_kcal
+
+
+def _meal_targets_from_daily(daily_kcal: int) -> dict[str, int]:
+    breakfast = int(round(daily_kcal * 0.30))
+    lunch = int(round(daily_kcal * 0.35))
+    dinner = max(0, daily_kcal - breakfast - lunch)
+    return {"breakfast": breakfast, "lunch": lunch, "dinner": dinner}
+
+
+def _goal_macro_ratio(goal_type: str) -> tuple[float, float, float]:
+    if goal_type == "diet":
+        return (0.40, 0.30, 0.30)  # carb, protein, fat
+    if goal_type == "bulk":
+        return (0.50, 0.25, 0.25)
+    return (0.45, 0.25, 0.30)
+
+
+def _menu_score(candidate: dict, meal_target_kcal: int, goal_type: str) -> float:
+    calories = float(candidate["calories_kcal"])
+    carbs = float(candidate["carbs_g"])
+    protein = float(candidate["protein_g"])
+    fat = float(candidate["fat_g"])
+    distance_m = float(candidate["distance_m"] or 9999.0)
+
+    calorie_penalty = abs(calories - meal_target_kcal) / max(1.0, float(meal_target_kcal))
+    ratio_c, ratio_p, ratio_f = _goal_macro_ratio(goal_type)
+    macro_total = (carbs * 4.0) + (protein * 4.0) + (fat * 9.0)
+    if macro_total <= 0.0:
+        macro_penalty = 1.0
+    else:
+        macro_penalty = (
+            abs((carbs * 4.0) / macro_total - ratio_c)
+            + abs((protein * 4.0) / macro_total - ratio_p)
+            + abs((fat * 9.0) / macro_total - ratio_f)
+        )
+
+    distance_penalty = min(distance_m / 1000.0, 1.5) * 0.15
+    confidence_bonus = float(candidate["confidence"]) * 0.25
+    return -calorie_penalty - macro_penalty - distance_penalty + confidence_bonus
+
+
+def _query_verified_menu_candidates(
+    db: Session,
+    user_number: int,
+    label: str,
+    radius_m: int,
+) -> list[dict]:
+    location = (
+        db.query(LocationProfile)
+        .filter(
+            LocationProfile.user_number == user_number,
+            LocationProfile.label == label,
+        )
+        .first()
+    )
+    if location is None:
+        raise HTTPException(status_code=404, detail=f"{label} 위치 프로필이 없습니다.")
+
+    rows = (
+        db.query(
+            Restaurant.restaurant_id,
+            Restaurant.name.label("restaurant_name"),
+            MenuItem.menu_id,
+            MenuItem.name.label("menu_name"),
+            MenuItem.price,
+            RestaurantSnapshot.distance_m,
+            NutritionFacts.calories_kcal,
+            NutritionFacts.carbs_g,
+            NutritionFacts.protein_g,
+            NutritionFacts.fat_g,
+            NutritionFacts.confidence,
+            NutritionFacts.nutrition_id,
+        )
+        .join(RestaurantSnapshot, RestaurantSnapshot.restaurant_id == Restaurant.restaurant_id)
+        .join(MenuItem, MenuItem.restaurant_id == Restaurant.restaurant_id)
+        .join(NutritionFacts, NutritionFacts.menu_item_id == MenuItem.menu_id)
+        .filter(RestaurantSnapshot.location_profile_id == location.location_id)
+        .filter(RestaurantSnapshot.distance_m <= radius_m)
+        .filter(MenuItem.name.isnot(None), MenuItem.price.isnot(None))
+        .filter(
+            NutritionFacts.calories_kcal.isnot(None),
+            NutritionFacts.carbs_g.isnot(None),
+            NutritionFacts.protein_g.isnot(None),
+            NutritionFacts.fat_g.isnot(None),
+        )
+        .filter(NutritionFacts.confidence.isnot(None), NutritionFacts.confidence >= 0.6)
+        .order_by(NutritionFacts.menu_item_id.asc(), NutritionFacts.nutrition_id.desc())
+        .all()
+    )
+
+    latest_by_menu: dict[int, dict] = {}
+    for row in rows:
+        row_map = row._asdict()
+        menu_id = int(row_map["menu_id"])
+        if menu_id in latest_by_menu:
+            continue
+        latest_by_menu[menu_id] = {
+            "restaurant_id": int(row_map["restaurant_id"]),
+            "restaurant_name": str(row_map["restaurant_name"]),
+            "menu_id": menu_id,
+            "menu_name": str(row_map["menu_name"]),
+            "price": float(row_map["price"]),
+            "distance_m": float(row_map["distance_m"] or 0.0),
+            "calories_kcal": float(row_map["calories_kcal"]),
+            "carbs_g": float(row_map["carbs_g"]),
+            "protein_g": float(row_map["protein_g"]),
+            "fat_g": float(row_map["fat_g"]),
+            "confidence": float(row_map["confidence"]),
+        }
+    return list(latest_by_menu.values())
 
 
 def _fetch_pexels_image(query: str) -> Optional[str]:
@@ -336,6 +520,1115 @@ def _kakao_local_search_keyword(lat: float, lng: float, radius_m: int, keyword: 
     except Exception as e:
         logger.exception("Kakao keyword search exception: %s", e)
         raise HTTPException(status_code=502, detail="Kakao Local API 요청 실패(키워드 검색)")
+
+
+def _kakao_geocode_address(address_text: str) -> tuple[float, float]:
+    if not KAKAO_REST_API_KEY:
+        raise HTTPException(status_code=500, detail="KAKAO_REST_API_KEY 환경변수가 필요합니다.")
+    query = (address_text or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="address_text가 필요합니다.")
+
+    try:
+        resp = requests.get(
+            KAKAO_LOCAL_ADDRESS_API_URL,
+            headers={"Authorization": f"KakaoAK {KAKAO_REST_API_KEY}"},
+            params={"query": query, "size": 1},
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502, detail="Kakao Geocoding API 오류")
+        data = resp.json()
+        docs = data.get("documents") or []
+        if not docs:
+            raise HTTPException(status_code=404, detail="주소를 좌표로 변환하지 못했습니다.")
+        first = docs[0]
+        x = float(first.get("x"))
+        y = float(first.get("y"))
+        return y, x
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Kakao geocode failed: %s", exc)
+        raise HTTPException(status_code=502, detail="Kakao Geocoding API 요청 실패")
+
+
+def _kakao_collect_restaurants(lat: float, lng: float, radius_m: int, max_count: int = 50) -> list[dict]:
+    if not KAKAO_REST_API_KEY:
+        raise HTTPException(status_code=500, detail="KAKAO_REST_API_KEY 환경변수가 필요합니다.")
+
+    radius = max(50, min(int(radius_m), 20000))
+    target_count = max(1, min(int(max_count), 50))
+    merged: dict[str, dict] = {}
+
+    for page in range(1, 6):
+        try:
+            resp = requests.get(
+                KAKAO_LOCAL_CATEGORY_API_URL,
+                headers={"Authorization": f"KakaoAK {KAKAO_REST_API_KEY}"},
+                params={
+                    "category_group_code": "FD6",
+                    "x": lng,
+                    "y": lat,
+                    "radius": radius,
+                    "sort": "distance",
+                    "size": 15,
+                    "page": page,
+                },
+                timeout=5,
+            )
+            if resp.status_code != 200:
+                break
+            data = resp.json()
+            docs = data.get("documents") or []
+            if not docs:
+                break
+            for doc in docs:
+                pid = str(doc.get("id") or "").strip()
+                if not pid or pid in merged:
+                    continue
+                merged[pid] = doc
+            if len(merged) >= target_count:
+                break
+            meta = data.get("meta") or {}
+            if meta.get("is_end"):
+                break
+        except Exception:
+            break
+
+    def _distance(item: dict) -> int:
+        try:
+            return int(item.get("distance") or 10**9)
+        except Exception:
+            return 10**9
+
+    ordered = sorted(merged.values(), key=_distance)
+    return ordered[:target_count]
+
+
+def _upsert_location_profile(
+    db: Session,
+    user_number: int,
+    label: str,
+    address_text: str,
+    lat: float,
+    lng: float,
+) -> LocationProfile:
+    profile = (
+        db.query(LocationProfile)
+        .filter(LocationProfile.user_number == user_number, LocationProfile.label == label)
+        .one_or_none()
+    )
+    if profile is None:
+        profile = LocationProfile(
+            user_number=user_number,
+            label=label,
+            address_text=address_text,
+            lat=lat,
+            lng=lng,
+        )
+        db.add(profile)
+        db.flush()
+    else:
+        profile.address_text = address_text
+        profile.lat = lat
+        profile.lng = lng
+    return profile
+
+
+def _upsert_restaurant_and_snapshot(
+    db: Session,
+    location_profile_id: int,
+    kakao_doc: dict,
+) -> Restaurant:
+    source_place_id = str(kakao_doc.get("id") or "").strip()
+    restaurant = (
+        db.query(Restaurant)
+        .filter(Restaurant.source == "kakao", Restaurant.source_place_id == source_place_id)
+        .one_or_none()
+    )
+    if restaurant is None:
+        restaurant = Restaurant(
+            source="kakao",
+            source_place_id=source_place_id,
+            name=(kakao_doc.get("place_name") or "").strip(),
+            category=(kakao_doc.get("category_name") or kakao_doc.get("category_group_name")),
+            address_text=(kakao_doc.get("road_address_name") or kakao_doc.get("address_name") or "").strip(),
+            lat=float(kakao_doc.get("y")) if kakao_doc.get("y") else None,
+            lng=float(kakao_doc.get("x")) if kakao_doc.get("x") else None,
+            phone=(kakao_doc.get("phone") or "").strip() or None,
+            place_url=(kakao_doc.get("place_url") or "").strip() or None,
+        )
+        db.add(restaurant)
+        db.flush()
+    else:
+        restaurant.name = (kakao_doc.get("place_name") or restaurant.name or "").strip()
+        restaurant.category = kakao_doc.get("category_name") or kakao_doc.get("category_group_name") or restaurant.category
+        restaurant.address_text = (kakao_doc.get("road_address_name") or kakao_doc.get("address_name") or restaurant.address_text or "").strip()
+        restaurant.lat = float(kakao_doc.get("y")) if kakao_doc.get("y") else restaurant.lat
+        restaurant.lng = float(kakao_doc.get("x")) if kakao_doc.get("x") else restaurant.lng
+        restaurant.phone = (kakao_doc.get("phone") or restaurant.phone or "").strip() or None
+        restaurant.place_url = (kakao_doc.get("place_url") or restaurant.place_url or "").strip() or None
+
+    snapshot = (
+        db.query(RestaurantSnapshot)
+        .filter(
+            RestaurantSnapshot.location_profile_id == location_profile_id,
+            RestaurantSnapshot.restaurant_id == restaurant.restaurant_id,
+        )
+        .one_or_none()
+    )
+    distance_m = None
+    try:
+        distance_m = float(kakao_doc.get("distance")) if kakao_doc.get("distance") else None
+    except Exception:
+        distance_m = None
+    if snapshot is None:
+        snapshot = RestaurantSnapshot(
+            location_profile_id=location_profile_id,
+            restaurant_id=restaurant.restaurant_id,
+            distance_m=distance_m,
+        )
+        db.add(snapshot)
+    else:
+        snapshot.distance_m = distance_m
+    return restaurant
+
+
+def _safe_float(text: str) -> Optional[float]:
+    try:
+        return float(str(text).strip())
+    except Exception:
+        return None
+
+
+def _search_web(query: str, max_results: int = 8) -> list[dict]:
+    q = (query or "").strip()
+    if not q:
+        return []
+
+    try:
+        if SERPER_API_KEY:
+            resp = requests.post(
+                "https://google.serper.dev/search",
+                headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+                json={"q": q, "num": max_results},
+                timeout=8,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                organic = data.get("organic") or []
+                return [
+                    {
+                        "title": item.get("title") or "",
+                        "snippet": item.get("snippet") or "",
+                        "url": item.get("link") or "",
+                    }
+                    for item in organic
+                ]
+
+        if TAVILY_API_KEY:
+            resp = requests.post(
+                "https://api.tavily.com/search",
+                json={
+                    "api_key": TAVILY_API_KEY,
+                    "query": q,
+                    "search_depth": "basic",
+                    "max_results": max_results,
+                },
+                timeout=8,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                rows = data.get("results") or []
+                return [
+                    {
+                        "title": row.get("title") or "",
+                        "snippet": row.get("content") or "",
+                        "url": row.get("url") or "",
+                    }
+                    for row in rows
+                ]
+
+        if SERPAPI_API_KEY:
+            resp = requests.get(
+                "https://serpapi.com/search.json",
+                params={"q": q, "api_key": SERPAPI_API_KEY, "num": max_results, "hl": "ko"},
+                timeout=8,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                organic = data.get("organic_results") or []
+                return [
+                    {
+                        "title": item.get("title") or "",
+                        "snippet": item.get("snippet") or "",
+                        "url": item.get("link") or "",
+                    }
+                    for item in organic
+                ]
+    except Exception as exc:
+        logger.warning("web search failed for query=%s error=%s", q, exc)
+    return []
+
+
+def _sanitize_menu_name(name: str, restaurant_name: str = "") -> str:
+    cleaned = re.sub(r"\s+", " ", (name or "").strip())
+    cleaned = re.sub(r"[|•]+", " ", cleaned)
+    cleaned = re.sub(r"\s*[-–]\s*(instagram|blog|블로그).*$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^[\s\.\-·•:;,]+", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -:;,.\u00b7")
+
+    # "가게명 메뉴명" 형태면 가게명 접두어 제거
+    rname = re.sub(r"\s+", "", (restaurant_name or "").strip().lower())
+    cname = re.sub(r"\s+", "", cleaned.lower())
+    if rname and cname.startswith(rname):
+        stripped = cleaned[len(restaurant_name):].strip(" -:;,.")
+        if stripped:
+            cleaned = stripped
+    return cleaned
+
+
+def _restaurant_name_tokens(restaurant_name: str) -> list[str]:
+    raw = re.sub(r"[\(\)\[\],/]", " ", restaurant_name or "")
+    tokens = []
+    for tk in re.split(r"\s+", raw.strip()):
+        tk = tk.strip()
+        if len(tk) < 2:
+            continue
+        low = tk.lower()
+        if low in {"점", "본점", "지점", "branch", "store", "the"}:
+            continue
+        tokens.append(low)
+    return tokens
+
+
+def _restaurant_row_relevance(row: dict, restaurant: Restaurant) -> float:
+    title = str(row.get("title") or "")
+    snippet = str(row.get("snippet") or "")
+    url = str(row.get("url") or "")
+    text = f"{title} {snippet}".lower()
+    text_norm = re.sub(r"\s+", "", text)
+    full_name = (restaurant.name or "").strip().lower()
+    full_name_norm = re.sub(r"\s+", "", full_name)
+
+    score = 0.0
+    if full_name_norm and full_name_norm in text_norm:
+        score += 0.65
+    if restaurant.place_url and restaurant.place_url in url:
+        score += 0.45
+
+    token_hits = 0
+    for tk in _restaurant_name_tokens(restaurant.name or ""):
+        if tk in text:
+            token_hits += 1
+    if token_hits >= 2:
+        score += 0.35
+    elif token_hits == 1:
+        score += 0.18
+
+    addr_tokens = [t.lower() for t in re.split(r"\s+", (restaurant.address_text or "").strip()) if len(t) >= 2][:2]
+    addr_hits = sum(1 for tk in addr_tokens if tk in text)
+    if addr_hits:
+        score += min(0.15 * addr_hits, 0.3)
+
+    return max(0.0, min(score, 1.0))
+
+
+def _is_relevant_row_for_restaurant(row: dict, restaurant: Restaurant) -> bool:
+    relevance = _restaurant_row_relevance(row, restaurant)
+    min_relevance = _safe_float(os.getenv("MENU_ROW_RELEVANCE_MIN", "0.58")) or 0.58
+    return relevance >= min_relevance
+
+
+def _is_valid_menu_name(name: str, restaurant_name: str = "") -> bool:
+    value = _sanitize_menu_name(name, restaurant_name)
+    if not value:
+        return False
+    if len(value) < 2 or len(value) > 28:
+        return False
+    if len(value.split()) > 4:
+        return False
+    if not re.search(r"[가-힣A-Za-z]", value):
+        return False
+
+    bad_keywords = [
+        "강남역", "추천", "맛집", "혼밥", "후기", "리뷰", "방문", "다녀왔", "instagram",
+        "인스타", "블로그", "주소", "전화", "영업시간", "예약", "주차", "원산지",
+        "메뉴판", "무한리필", "셀프바", "출구점", "점심", "저녁", "브레이크타임",
+        "이전 페이지", "완벽한 하루", "런치", "lunch", "dinner",
+    ]
+    lower = value.lower()
+    if any(k in lower for k in bad_keywords):
+        return False
+
+    # 불필요한 기호로 시작하는 케이스 방지 (예: "· 잠봉 펜네 샐러드")
+    if re.match(r"^[\.\-·•]", value):
+        return False
+
+    # 음식명으로 보기 어려운 일반 문구 차단
+    generic_phrase_patterns = [
+        r"추천\s*$",
+        r"맛집\s*$",
+        r"^\s*이전\s*페이지",
+        r"^\s*완벽한\s*하루\s*$",
+    ]
+    if any(re.search(p, lower, flags=re.IGNORECASE) for p in generic_phrase_patterns):
+        return False
+
+    food_keyword_patterns = [
+        r"(밥|국|탕|찌개|전골|국수|면|냉면|라면|우동|소바|덮밥|비빔밥|김밥|죽|포케|샐러드)",
+        r"(볶음|구이|튀김|찜|수육|보쌈|족발|불고기|갈비|스테이크|돈까스|카츠|치킨|버거|샌드위치)",
+        r"(피자|파스타|리조또|펜네|라자냐|타코|케밥|쌀국수|분짜|샤브|스키야키)",
+        r"(커피|라떼|에이드|티|차|주스|스무디|디저트|케이크|빙수)",
+        r"(salad|pasta|pizza|steak|burger|sandwich|ramen|udon|soup|noodle|rice|set)",
+    ]
+    has_food_hint = any(re.search(p, lower, flags=re.IGNORECASE) for p in food_keyword_patterns)
+    if not has_food_hint and len(value.split()) >= 3:
+        return False
+
+    # 숫자/기호 비율이 너무 높으면 메뉴명이 아닐 가능성이 큼
+    alpha_count = len(re.findall(r"[가-힣A-Za-z]", value))
+    if alpha_count < max(2, len(value) // 3):
+        return False
+
+    rname = re.sub(r"\s+", "", (restaurant_name or "").strip().lower())
+    vnorm = re.sub(r"\s+", "", lower)
+    if rname and vnorm == rname:
+        return False
+    return True
+
+
+def _extract_menu_candidates_from_text(raw_text: str, restaurant_name: str = "") -> list[dict]:
+    text = (raw_text or "").replace("\u00a0", " ")
+    lines = [ln.strip() for ln in re.split(r"[\n\r]+", text) if ln.strip()]
+    out: list[dict] = []
+    seen: set[tuple[str, int]] = set()
+
+    pattern_inline = re.compile(
+        r"([가-힣A-Za-z0-9\s\(\)\[\]\-_/&\+\.,'·]{2,80})\s*(?:[:\-]|\s)\s*([0-9][0-9,]{2,7})\s*원"
+    )
+    pattern_price = re.compile(r"([0-9][0-9,]{2,7})\s*원")
+    noise_patterns = [
+        r"메뉴",
+        r"가격",
+        r"원산지",
+        r"영업시간",
+        r"리뷰",
+        r"전화",
+        r"주소",
+        r"주문",
+    ]
+
+    for line in lines:
+        for match in pattern_inline.finditer(line):
+            name = _sanitize_menu_name(match.group(1), restaurant_name)
+            price = int(match.group(2).replace(",", ""))
+            if price < 1000 or not _is_valid_menu_name(name, restaurant_name):
+                continue
+            key = (name.lower(), price)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"name": name, "price": float(price), "description": None})
+
+    # 2-line format: "메뉴명" next line "12000원"
+    for idx in range(len(lines) - 1):
+        line = lines[idx]
+        next_line = lines[idx + 1]
+        p = pattern_price.search(next_line)
+        if not p:
+            continue
+        name = _sanitize_menu_name(line, restaurant_name)
+        if len(name) > 45 or any(re.search(np, name, flags=re.IGNORECASE) for np in noise_patterns):
+            continue
+        price = int(p.group(1).replace(",", ""))
+        if price < 1000 or not _is_valid_menu_name(name, restaurant_name):
+            continue
+        key = (name.lower(), price)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"name": name, "price": float(price), "description": None})
+
+    return out[:20]
+
+
+def _build_menu_seed_queries(restaurant: Restaurant) -> list[str]:
+    place_name = re.sub(r"\s+", " ", (restaurant.name or "").strip())
+    place_url = (restaurant.place_url or "").strip()
+    address = re.sub(r"\s+", " ", (restaurant.address_text or "").strip())
+    address_seed = " ".join(address.split()[:2]).strip()
+    simple_name = re.sub(r"\([^)]*\)", "", place_name).strip()
+
+    candidates = [
+        f'"{place_name}" 메뉴 가격',
+        f'"{place_name}" 메뉴판 가격',
+    ]
+    if address_seed:
+        candidates.append(f'"{place_name}" "{address_seed}" 메뉴 가격')
+    if place_url:
+        candidates.append(f'"{place_name}" "{place_url}" 메뉴 가격')
+        candidates.append(f"site:kakao.com {place_name} 메뉴 가격")
+    if simple_name and simple_name != place_name:
+        candidates.append(f'"{simple_name}" 메뉴 가격')
+        if address_seed:
+            candidates.append(f'"{simple_name}" "{address_seed}" 메뉴 가격')
+        if place_url:
+            candidates.append(f'"{simple_name}" "{place_url}" 메뉴 가격')
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for query in candidates:
+        key = query.strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(query)
+    return out[:8]
+
+
+def _score_menu_candidate(row: dict, restaurant: Restaurant, menu_name: str) -> float:
+    title = str(row.get("title") or "")
+    snippet = str(row.get("snippet") or "")
+    url = str(row.get("url") or "")
+    text = f"{title} {snippet}".lower()
+    normalized_place = re.sub(r"\s+", "", (restaurant.name or "").lower())
+    normalized_menu = re.sub(r"\s+", "", (menu_name or "").lower())
+    normalized_text = re.sub(r"\s+", "", text)
+
+    score = 0.35 + (_restaurant_row_relevance(row, restaurant) * 0.45)
+    if normalized_place and normalized_place in normalized_text:
+        score += 0.2
+    if normalized_menu and normalized_menu in normalized_text:
+        score += 0.2
+    if restaurant.place_url and restaurant.place_url in url:
+        score += 0.1
+    if "메뉴" in text and "가격" in text:
+        score += 0.05
+    return max(0.0, min(score, 0.95))
+
+
+def _estimate_menu_set_confidence(menus: list[dict]) -> float:
+    if not menus:
+        return 0.0
+    values = []
+    for menu in menus:
+        try:
+            values.append(float(menu.get("menu_confidence") or 0.0))
+        except Exception:
+            continue
+    if not values:
+        return 0.0
+    avg = sum(values) / len(values)
+    coverage_bonus = min(len(values), 5) * 0.03
+    return max(0.0, min(avg + coverage_bonus, 1.0))
+
+
+def _search_menu_candidates(restaurant: Restaurant) -> list[dict]:
+    queries = _build_menu_seed_queries(restaurant)
+    place_url = (restaurant.place_url or "").strip()
+
+    merged_rows: list[dict] = []
+    seen_url: set[str] = set()
+    for query in queries:
+        rows = _search_web(query, max_results=8)
+        for row in rows:
+            url = (row.get("url") or "").strip()
+            key = url or f"{row.get('title','')}|{row.get('snippet','')}"
+            if key in seen_url:
+                continue
+            seen_url.add(key)
+            merged_rows.append(row)
+        if len(merged_rows) >= 8:
+            break
+
+    out: list[dict] = []
+    dedup: set[tuple[str, int]] = set()
+    for row in merged_rows:
+        if not _is_relevant_row_for_restaurant(row, restaurant):
+            continue
+        row_text = "\n".join(
+            part for part in [row.get("title") or "", row.get("snippet") or ""] if part
+        )
+        for menu in _extract_menu_candidates_from_text(row_text, restaurant.name or ""):
+            name = _sanitize_menu_name(str(menu.get("name") or "").strip(), restaurant.name or "")
+            price_value = _safe_float(str(menu.get("price")))
+            if not name or price_value is None or not _is_valid_menu_name(name, restaurant.name or ""):
+                continue
+            price = int(price_value)
+            key = (_normalize_menu_name(name), price)
+            if not key[0] or key in dedup:
+                continue
+            dedup.add(key)
+            out.append(
+                {
+                    "name": name,
+                    "price": float(price),
+                    "description": menu.get("description") or "web-search",
+                    "source_url": (row.get("url") or "").strip() or place_url or None,
+                    "menu_confidence": _score_menu_candidate(row, restaurant, name),
+                }
+            )
+
+    # row별 추출이 부족하면 전체 텍스트에서도 보강 추출
+    if len(out) < 3 and merged_rows:
+        merged_text = "\n".join(
+            f"{row.get('title','')} {row.get('snippet','')}".strip()
+            for row in merged_rows
+            if _is_relevant_row_for_restaurant(row, restaurant)
+        )
+        default_source_url = (merged_rows[0].get("url") or "").strip() or place_url or None
+        for menu in _extract_menu_candidates_from_text(merged_text, restaurant.name or ""):
+            name = _sanitize_menu_name(str(menu.get("name") or "").strip(), restaurant.name or "")
+            price_value = _safe_float(str(menu.get("price")))
+            if not name or price_value is None or not _is_valid_menu_name(name, restaurant.name or ""):
+                continue
+            price = int(price_value)
+            key = (_normalize_menu_name(name), price)
+            if not key[0] or key in dedup:
+                continue
+            dedup.add(key)
+            out.append(
+                {
+                    "name": name,
+                    "price": float(price),
+                    "description": menu.get("description") or "web-search-merged",
+                    "source_url": default_source_url,
+                    "menu_confidence": 0.45,
+                }
+            )
+    return out[:10]
+
+
+def _llm_infer_menu_candidates(restaurant: Restaurant) -> list[dict]:
+    if openai_client is None:
+        return []
+    try:
+        prompt = (
+            "다음 음식점의 대표 메뉴를 추정해서 JSON 배열로 반환해라.\n"
+            f"- 음식점명: {restaurant.name}\n"
+            f"- 카테고리: {restaurant.category or ''}\n"
+            f"- 주소: {restaurant.address_text or ''}\n"
+            "형식: [{name, price, description}] 최대 8개. price는 숫자(원)로."
+        )
+        resp = openai_client.chat.completions.create(
+            model=os.getenv("OPENAI_MENU_MODEL", "gpt-4.1-mini"),
+            temperature=0.3,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": "너는 메뉴 데이터 수집기다. JSON만 반환한다."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        content = resp.choices[0].message.content or "{}"
+        data = json.loads(content)
+        rows = data.get("menus")
+        if not isinstance(rows, list):
+            rows = data if isinstance(data, list) else []
+        out: list[dict] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            name = _sanitize_menu_name(str(row.get("name") or "").strip(), restaurant.name or "")
+            price = row.get("price")
+            try:
+                price_value = float(price)
+            except Exception:
+                continue
+            if not name or price_value < 1000 or not _is_valid_menu_name(name, restaurant.name or ""):
+                continue
+            out.append(
+                {
+                    "name": name,
+                    "price": price_value,
+                    "description": (row.get("description") or "llm-fallback"),
+                    "source_url": None,
+                    "menu_confidence": 0.55,
+                }
+            )
+        return out[:8]
+    except Exception as exc:
+        logger.warning("llm menu inference failed: %s", exc)
+        return []
+
+
+def _collect_menus_for_restaurant(restaurant: Restaurant) -> list[dict]:
+    menus = [
+        m for m in _search_menu_candidates(restaurant)
+        if _is_valid_menu_name(str(m.get("name") or ""), restaurant.name or "")
+    ]
+    search_conf = _estimate_menu_set_confidence(menus)
+    min_conf = _safe_float(os.getenv("MENU_SEARCH_CONFIDENCE_MIN", "0.62")) or 0.62
+
+    if not menus or search_conf < min_conf:
+        llm_menus = [
+            m for m in _llm_infer_menu_candidates(restaurant)
+            if _is_valid_menu_name(str(m.get("name") or ""), restaurant.name or "")
+        ]
+        if not menus:
+            return llm_menus[:10]
+        if llm_menus:
+            # 검색 결과가 매우 약하면 LLM 결과를 우선 사용
+            if search_conf < 0.35:
+                return llm_menus[:10]
+
+            merged = list(menus)
+            seen_norm = {_normalize_menu_name(str(m.get("name") or "")) for m in merged}
+            for menu in llm_menus:
+                norm = _normalize_menu_name(str(menu.get("name") or ""))
+                if not norm or norm in seen_norm:
+                    continue
+                merged.append(menu)
+                seen_norm.add(norm)
+                if len(merged) >= 10:
+                    break
+            return merged[:10]
+
+    return menus[:10]
+
+
+def _parse_nutrition_from_text(text: str) -> Optional[dict]:
+    if not text:
+        return None
+    lower = text.lower()
+    kcal_patterns = [r"([0-9]+(?:\.[0-9]+)?)\s*kcal", r"칼로리\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?)"]
+    carb_patterns = [r"탄수화물\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?)\s*g", r"carb[s]?\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?)"]
+    protein_patterns = [r"단백질\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?)\s*g", r"protein\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?)"]
+    fat_patterns = [r"지방\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?)\s*g", r"fat\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?)"]
+
+    def first(patterns: list[str]) -> Optional[float]:
+        for p in patterns:
+            m = re.search(p, lower, flags=re.IGNORECASE)
+            if not m:
+                continue
+            v = _safe_float(m.group(1))
+            if v is not None:
+                return v
+        return None
+
+    calories = first(kcal_patterns)
+    carbs = first(carb_patterns)
+    protein = first(protein_patterns)
+    fat = first(fat_patterns)
+    if any(v is None for v in (calories, carbs, protein, fat)):
+        return None
+    return {
+        "calories_kcal": float(calories),
+        "carbs_g": float(carbs),
+        "protein_g": float(protein),
+        "fat_g": float(fat),
+        "confidence": 0.75,
+        "source_type": "search",
+    }
+
+
+def _search_nutrition(restaurant: Restaurant, menu_name: str) -> Optional[dict]:
+    query = f"{restaurant.name} {menu_name} 칼로리 탄수화물 단백질 지방"
+    rows = _search_web(query, max_results=6)
+    snippets = "\n".join([f"{row.get('title','')} {row.get('snippet','')}" for row in rows])
+    parsed = _parse_nutrition_from_text(snippets)
+    if parsed:
+        parsed["source_ref"] = rows[0].get("url") if rows else None
+    return parsed
+
+
+def _llm_infer_nutrition(restaurant: Restaurant, menu_name: str, price: float) -> Optional[dict]:
+    if openai_client is None:
+        return None
+    try:
+        prompt = (
+            "다음 메뉴의 영양정보를 추정해라. JSON만 출력.\n"
+            f"- 음식점: {restaurant.name}\n"
+            f"- 카테고리: {restaurant.category or ''}\n"
+            f"- 메뉴: {menu_name}\n"
+            f"- 가격: {int(price)}원\n"
+            "필수키: calories_kcal, carbs_g, protein_g, fat_g, confidence"
+        )
+        resp = openai_client.chat.completions.create(
+            model=os.getenv("OPENAI_NUTRITION_MODEL", "gpt-4.1-mini"),
+            temperature=0.2,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": "너는 메뉴 영양정보 추정 전문가다. JSON만 반환한다."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        content = resp.choices[0].message.content or "{}"
+        data = json.loads(content)
+        for key in ("calories_kcal", "carbs_g", "protein_g", "fat_g", "confidence"):
+            if key not in data:
+                return None
+        raw_conf = data.get("confidence")
+        if isinstance(raw_conf, str):
+            conf_map = {"low": 0.45, "medium": 0.65, "high": 0.85}
+            confidence = conf_map.get(raw_conf.strip().lower(), 0.6)
+        else:
+            confidence = float(raw_conf)
+
+        return {
+            "calories_kcal": float(data["calories_kcal"]),
+            "carbs_g": float(data["carbs_g"]),
+            "protein_g": float(data["protein_g"]),
+            "fat_g": float(data["fat_g"]),
+            "confidence": confidence,
+            "source_type": "infer",
+            "source_ref": "openai-fallback",
+        }
+    except Exception as exc:
+        logger.warning("llm nutrition inference failed: %s", exc)
+        return None
+
+
+def _resolve_nutrition(restaurant: Restaurant, menu_name: str, price: float) -> Optional[dict]:
+    by_search = _search_nutrition(restaurant, menu_name)
+    if by_search:
+        return by_search
+    return _llm_infer_nutrition(restaurant, menu_name, price)
+
+
+def _normalize_menu_name(value: str) -> str:
+    return re.sub(r"\s+", "", (value or "").strip().lower())
+
+
+def _get_existing_verified_by_restaurant(db: Session, restaurant_ids: list[int]) -> dict[int, list[dict]]:
+    if not restaurant_ids:
+        return {}
+    rows = (
+        db.query(
+            MenuItem.menu_id,
+            MenuItem.restaurant_id,
+            MenuItem.name.label("menu_name"),
+            MenuItem.description,
+            MenuItem.price,
+            MenuItem.source_url,
+            NutritionFacts.nutrition_id,
+            NutritionFacts.calories_kcal,
+            NutritionFacts.carbs_g,
+            NutritionFacts.protein_g,
+            NutritionFacts.fat_g,
+            NutritionFacts.confidence,
+            NutritionFacts.source_type,
+            NutritionFacts.source_ref,
+        )
+        .join(NutritionFacts, NutritionFacts.menu_item_id == MenuItem.menu_id)
+        .filter(MenuItem.restaurant_id.in_(restaurant_ids))
+        .filter(MenuItem.name.isnot(None), MenuItem.price.isnot(None))
+        .filter(
+            NutritionFacts.calories_kcal.isnot(None),
+            NutritionFacts.carbs_g.isnot(None),
+            NutritionFacts.protein_g.isnot(None),
+            NutritionFacts.fat_g.isnot(None),
+        )
+        .filter(NutritionFacts.confidence.isnot(None), NutritionFacts.confidence >= 0.6)
+        .order_by(MenuItem.menu_id.asc(), NutritionFacts.nutrition_id.desc())
+        .all()
+    )
+    latest_by_menu: dict[int, dict] = {}
+    for row in rows:
+        rec = row._asdict()
+        menu_id = int(rec["menu_id"])
+        if menu_id in latest_by_menu:
+            continue
+        latest_by_menu[menu_id] = rec
+
+    out: dict[int, list[dict]] = {}
+    for rec in latest_by_menu.values():
+        rid = int(rec["restaurant_id"])
+        out.setdefault(rid, []).append(
+            {
+                "name": rec["menu_name"],
+                "price": float(rec["price"]),
+                "description": rec.get("description"),
+                "source_url": rec.get("source_url"),
+                "nutrition": {
+                    "calories_kcal": float(rec["calories_kcal"]),
+                    "carbs_g": float(rec["carbs_g"]),
+                    "protein_g": float(rec["protein_g"]),
+                    "fat_g": float(rec["fat_g"]),
+                    "confidence": float(rec["confidence"]),
+                    "source_type": rec.get("source_type") or "search",
+                    "source_ref": rec.get("source_ref"),
+                },
+            }
+        )
+    return out
+
+
+def _get_global_nutrition_cache(db: Session) -> dict[str, dict]:
+    rows = (
+        db.query(
+            MenuItem.name.label("menu_name"),
+            NutritionFacts.nutrition_id,
+            NutritionFacts.calories_kcal,
+            NutritionFacts.carbs_g,
+            NutritionFacts.protein_g,
+            NutritionFacts.fat_g,
+            NutritionFacts.confidence,
+            NutritionFacts.source_ref,
+        )
+        .join(NutritionFacts, NutritionFacts.menu_item_id == MenuItem.menu_id)
+        .filter(MenuItem.name.isnot(None))
+        .filter(
+            NutritionFacts.calories_kcal.isnot(None),
+            NutritionFacts.carbs_g.isnot(None),
+            NutritionFacts.protein_g.isnot(None),
+            NutritionFacts.fat_g.isnot(None),
+        )
+        .filter(NutritionFacts.confidence.isnot(None), NutritionFacts.confidence >= 0.6)
+        .order_by(NutritionFacts.nutrition_id.desc())
+        .limit(5000)
+        .all()
+    )
+    out: dict[str, dict] = {}
+    for row in rows:
+        rec = row._asdict()
+        key = _normalize_menu_name(str(rec["menu_name"] or ""))
+        if not key or key in out:
+            continue
+        out[key] = {
+            "calories_kcal": float(rec["calories_kcal"]),
+            "carbs_g": float(rec["carbs_g"]),
+            "protein_g": float(rec["protein_g"]),
+            "fat_g": float(rec["fat_g"]),
+            "confidence": float(rec["confidence"]),
+            "source_type": "db_cache",
+            "source_ref": rec.get("source_ref") or "db-cache",
+        }
+    return out
+
+
+def _collect_restaurant_payload_sync(restaurant: Restaurant, nutrition_cache: dict[str, dict]) -> dict:
+    skipped = 0
+    menus = _collect_menus_for_restaurant(restaurant)
+    if not menus:
+        return {"restaurant_id": restaurant.restaurant_id, "items": [], "skipped": 1}
+
+    seen_menu_norm: set[str] = set()
+    complete_items: list[dict] = []
+    for menu in menus:
+        menu_name = (menu.get("name") or "").strip()
+        price = menu.get("price")
+        if not menu_name or not restaurant.name or price is None:
+            skipped += 1
+            continue
+        norm = _normalize_menu_name(menu_name)
+        if not norm or norm in seen_menu_norm:
+            skipped += 1
+            continue
+        seen_menu_norm.add(norm)
+
+        nutrition = nutrition_cache.get(norm)
+        if nutrition is None:
+            nutrition = _resolve_nutrition(restaurant, menu_name, float(price))
+        if not nutrition:
+            skipped += 1
+            continue
+        if nutrition.get("confidence", 0.0) < 0.6:
+            skipped += 1
+            continue
+        if any(nutrition.get(k) is None for k in ("calories_kcal", "carbs_g", "protein_g", "fat_g")):
+            skipped += 1
+            continue
+
+        complete_items.append(
+            {
+                "name": menu_name,
+                "price": float(price),
+                "description": menu.get("description"),
+                "source_url": menu.get("source_url"),
+                "nutrition": nutrition,
+            }
+        )
+    return {"restaurant_id": restaurant.restaurant_id, "items": complete_items, "skipped": skipped}
+
+
+async def _collect_restaurant_payloads_async(
+    restaurants: list[Restaurant],
+    nutrition_cache: dict[str, dict],
+    concurrency: int = 6,
+) -> list[dict]:
+    sem = asyncio.Semaphore(max(1, concurrency))
+
+    async def _one(restaurant: Restaurant) -> dict:
+        async with sem:
+            return await asyncio.to_thread(_collect_restaurant_payload_sync, restaurant, nutrition_cache)
+
+    tasks = [_one(restaurant) for restaurant in restaurants]
+    return await asyncio.gather(*tasks)
+
+
+def _run_collector_pipeline(
+    db: Session,
+    user: User,
+    payload: CollectorRunRequest,
+) -> dict:
+    label = (payload.label or "").strip().lower()
+    if label not in {"home", "work"}:
+        raise HTTPException(status_code=400, detail="label은 home/work 중 하나여야 합니다.")
+
+    existing_location = (
+        db.query(LocationProfile)
+        .filter(LocationProfile.user_number == user.user_number, LocationProfile.label == label)
+        .one_or_none()
+    )
+    if payload.lat is None or payload.lng is None:
+        if payload.address_text and payload.address_text.strip():
+            lat, lng = _kakao_geocode_address(payload.address_text)
+            address_text = payload.address_text.strip()
+        elif existing_location and existing_location.lat is not None and existing_location.lng is not None:
+            lat, lng = float(existing_location.lat), float(existing_location.lng)
+            address_text = (existing_location.address_text or f"{lat:.6f},{lng:.6f}").strip()
+        else:
+            raise HTTPException(status_code=400, detail="lat/lng 또는 address_text가 필요합니다.")
+    else:
+        lat, lng = float(payload.lat), float(payload.lng)
+        address_text = (payload.address_text or (existing_location.address_text if existing_location else None) or f"{lat:.6f},{lng:.6f}").strip()
+    requested_radius = max(100, min(int(payload.radius_m or 500), 3000))
+    restaurants_raw = _kakao_collect_restaurants(lat, lng, requested_radius, payload.max_restaurants or 50)
+
+    location = _upsert_location_profile(
+        db=db,
+        user_number=user.user_number,
+        label=label,
+        address_text=address_text,
+        lat=lat,
+        lng=lng,
+    )
+
+    menus_saved = 0
+    nutritions_saved = 0
+    skipped = 0
+
+    restaurants: list[Restaurant] = []
+    for raw in restaurants_raw:
+        if not raw.get("id") or not raw.get("place_name"):
+            skipped += 1
+            continue
+        restaurants.append(_upsert_restaurant_and_snapshot(db, location.location_id, raw))
+    db.flush()
+    restaurant_count = len(restaurants)
+
+    restaurant_ids = [restaurant.restaurant_id for restaurant in restaurants]
+    existing_verified = _get_existing_verified_by_restaurant(db, restaurant_ids)
+    global_nutrition_cache = _get_global_nutrition_cache(db)
+
+    network_targets = [restaurant for restaurant in restaurants if not existing_verified.get(restaurant.restaurant_id)]
+    fetched_payloads: dict[int, dict] = {}
+    if network_targets:
+        concurrency = min(10, max(3, int(os.getenv("COLLECTOR_CONCURRENCY", "6"))))
+        fetched = asyncio.run(
+            _collect_restaurant_payloads_async(
+                restaurants=network_targets,
+                nutrition_cache=global_nutrition_cache,
+                concurrency=concurrency,
+            )
+        )
+        for item in fetched:
+            fetched_payloads[int(item["restaurant_id"])] = item
+            skipped += int(item.get("skipped") or 0)
+
+    for restaurant in restaurants:
+        rid = restaurant.restaurant_id
+        complete_items = existing_verified.get(rid)
+        if complete_items is None:
+            complete_items = (fetched_payloads.get(rid) or {}).get("items") or []
+        if not complete_items:
+            skipped += 1
+            continue
+
+        existing_menus = (
+            db.query(MenuItem)
+            .filter(MenuItem.restaurant_id == rid)
+            .all()
+        )
+        menu_map = {_normalize_menu_name(menu.name): menu for menu in existing_menus}
+        latest_nutrition_by_menu: dict[int, NutritionFacts] = {}
+        if existing_menus:
+            menu_ids = [m.menu_id for m in existing_menus]
+            nutrition_rows = (
+                db.query(NutritionFacts)
+                .filter(NutritionFacts.menu_item_id.in_(menu_ids))
+                .order_by(NutritionFacts.menu_item_id.asc(), NutritionFacts.nutrition_id.desc())
+                .all()
+            )
+            for row in nutrition_rows:
+                if row.menu_item_id not in latest_nutrition_by_menu:
+                    latest_nutrition_by_menu[row.menu_item_id] = row
+
+        seen_batch: set[str] = set()
+        for item in complete_items:
+            name = (item.get("name") or "").strip()
+            price = item.get("price")
+            nutrition = item.get("nutrition") or {}
+            if not name or price is None:
+                skipped += 1
+                continue
+            norm = _normalize_menu_name(name)
+            if not norm or norm in seen_batch:
+                skipped += 1
+                continue
+            seen_batch.add(norm)
+
+            menu = menu_map.get(norm)
+            if menu is None:
+                menu = MenuItem(
+                    restaurant_id=rid,
+                    name=name,
+                    description=(item.get("description") or "").strip() or None,
+                    price=float(price),
+                    source="search_or_llm",
+                    source_url=item.get("source_url") or restaurant.place_url,
+                )
+                db.add(menu)
+                db.flush()
+                menu_map[norm] = menu
+                menus_saved += 1
+            else:
+                menu.price = float(price)
+                menu.description = (item.get("description") or menu.description or "").strip() or None
+                menu.source = "search_or_llm"
+                menu.source_url = item.get("source_url") or restaurant.place_url
+
+            last = latest_nutrition_by_menu.get(menu.menu_id)
+            same_as_last = (
+                last is not None
+                and round(float(last.calories_kcal or 0.0), 2) == round(float(nutrition.get("calories_kcal") or 0.0), 2)
+                and round(float(last.carbs_g or 0.0), 2) == round(float(nutrition.get("carbs_g") or 0.0), 2)
+                and round(float(last.protein_g or 0.0), 2) == round(float(nutrition.get("protein_g") or 0.0), 2)
+                and round(float(last.fat_g or 0.0), 2) == round(float(nutrition.get("fat_g") or 0.0), 2)
+                and round(float(last.confidence or 0.0), 2) == round(float(nutrition.get("confidence") or 0.0), 2)
+            )
+            if same_as_last:
+                continue
+
+            row = NutritionFacts(
+                menu_item_id=menu.menu_id,
+                calories_kcal=float(nutrition["calories_kcal"]),
+                carbs_g=float(nutrition["carbs_g"]),
+                protein_g=float(nutrition["protein_g"]),
+                fat_g=float(nutrition["fat_g"]),
+                source_type=nutrition.get("source_type", "infer"),
+                source_ref=nutrition.get("source_ref"),
+                confidence=float(nutrition["confidence"]),
+            )
+            db.add(row)
+            latest_nutrition_by_menu[menu.menu_id] = row
+            nutritions_saved += 1
+
+    db.commit()
+    return {
+        "label": label,
+        "location_profile_id": int(location.location_id),
+        "lat": float(lat),
+        "lng": float(lng),
+        "requested_radius_m": requested_radius,
+        "used_radius_m": requested_radius,
+        "restaurants_collected": restaurant_count,
+        "menus_saved": menus_saved,
+        "nutritions_saved": nutritions_saved,
+        "skipped_items": skipped,
+    }
 
 
 def _extract_food_tokens(food_name: str) -> List[str]:
@@ -862,6 +2155,123 @@ def upsert_user_goal(
         "plan": plan,
         "today_intake": today_intake,
     }
+
+
+@app.post("/api/recommend/menu-save", response_model=PersonalizedMenuResponse)
+def generate_menu_save(
+    payload: PersonalizedMenuRequest,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    label = (payload.label or "").strip().lower()
+    if label not in {"home", "work"}:
+        raise HTTPException(status_code=400, detail="label은 home/work 중 하나여야 합니다.")
+
+    requested_radius = max(100, min(int(payload.radius_m or 500), 3000))
+    goal_type = _resolve_goal_type_for_user(db, current_user.user_number)
+    tdee_kcal = _resolve_tdee_kcal_for_user(db, current_user)
+    daily_target_kcal = _goal_daily_target_kcal(tdee_kcal, goal_type)
+    meal_targets = _meal_targets_from_daily(daily_target_kcal)
+
+    has_request_location = bool((payload.address_text or "").strip()) or (
+        payload.lat is not None and payload.lng is not None
+    )
+
+    # 1) 요청에 위치가 있으면: 수집/저장 먼저 수행
+    collector_triggered = False
+    if has_request_location:
+        collector_triggered = True
+        _run_collector_pipeline(
+            db=db,
+            user=current_user,
+            payload=CollectorRunRequest(
+                label=label,
+                address_text=(payload.address_text or "").strip() or None,
+                lat=payload.lat,
+                lng=payload.lng,
+                radius_m=requested_radius,
+                max_restaurants=50,
+            ),
+        )
+
+    # 2) 추천 조회: 요청 위치 없으면 기존 DB location_profiles 기반 조회
+    try:
+        candidates = _query_verified_menu_candidates(
+            db=db,
+            user_number=current_user.user_number,
+            label=label,
+            radius_m=requested_radius,
+        )
+    except HTTPException as exc:
+        if exc.status_code == 404 and not has_request_location:
+            raise HTTPException(
+                status_code=400,
+                detail="요청 위치(address_text 또는 lat/lng)와 저장된 location_profiles가 모두 없습니다.",
+            )
+        raise
+
+    used_radius = requested_radius
+    if len(candidates) < 9 and requested_radius < 1000:
+        collector_triggered = True
+        used_radius = 1000
+        _run_collector_pipeline(
+            db=db,
+            user=current_user,
+            payload=CollectorRunRequest(
+                label=label,
+                radius_m=used_radius,
+                max_restaurants=50,
+            ),
+        )
+        candidates = _query_verified_menu_candidates(
+            db=db,
+            user_number=current_user.user_number,
+            label=label,
+            radius_m=used_radius,
+        )
+
+    total_candidates = len(candidates)
+    ranked: dict[str, list[dict]] = {"breakfast": [], "lunch": [], "dinner": []}
+    used_menu_ids: set[int] = set()
+    for meal in ("breakfast", "lunch", "dinner"):
+        target = meal_targets[meal]
+        scored = sorted(
+            candidates,
+            key=lambda item: _menu_score(item, target, goal_type),
+            reverse=True,
+        )
+        picked: list[dict] = []
+        for item in scored:
+            menu_id = int(item.get("menu_id"))
+            if menu_id in used_menu_ids:
+                continue
+            picked.append(item)
+            used_menu_ids.add(menu_id)
+            if len(picked) >= 3:
+                break
+        ranked[meal] = picked
+
+    return PersonalizedMenuResponse(
+        goal_type=goal_type,
+        tdee_kcal=tdee_kcal,
+        daily_target_kcal=daily_target_kcal,
+        meal_target_kcal=meal_targets,
+        total_candidates=total_candidates,
+        used_radius_m=used_radius,
+        collector_triggered=collector_triggered,
+        breakfast=[PersonalizedMenuItem(**row) for row in ranked["breakfast"]],
+        lunch=[PersonalizedMenuItem(**row) for row in ranked["lunch"]],
+        dinner=[PersonalizedMenuItem(**row) for row in ranked["dinner"]],
+    )
+
+
+@app.post("/api/collector/run", response_model=CollectorRunResponse)
+def run_collector_pipeline(
+    payload: CollectorRunRequest,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    return CollectorRunResponse(**_run_collector_pipeline(db=db, user=current_user, payload=payload))
 
 
 @app.post("/api/diet-plan", response_model=DietPlanWithIntakeResponse)
