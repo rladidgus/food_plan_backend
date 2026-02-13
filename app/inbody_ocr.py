@@ -16,7 +16,6 @@ from app.database import SessionLocal
 from app.models import User, UserProfile, InBodyRecord, BMIHistory, UserGoal, UserDietPlan
 from app.inbody import InbodyInput, classify_body_type, thresholds
 from app.goal_rules import infer_goal_type, estimate_target_calorie, normalize_activity_level
-from app.meal_plan_ai import generate_one_day_plan
 
 # 1) 환경변수 로드 (.env에 UPSTAGE_API_KEY=... 넣어두면 됨)
 load_dotenv(override=False)
@@ -594,40 +593,6 @@ def update_user_inbody(user_number: int, values: dict) -> None:
 
             if profile:
                 profile.goal_type = goal_type
-                if target_calorie is not None:
-                    prompt = {
-                        "goal_type": goal_type,
-                        "target_calorie": round(float(target_calorie)) if target_calorie else None,
-                        "body_type_stage1": result.stage1,
-                        "body_type_stage2": result.stage2,
-                        "latest_inbody": {
-                            "height_cm": new_record.height,
-                            "weight_kg": new_record.weight,
-                            "body_fat_pct": new_record.body_fat_pct,
-                            "skeletal_muscle_kg": new_record.skeletal_muscle_mass,
-                            "bmr_kcal": new_record.bmr,
-                        },
-                        "activity_level": normalize_activity_level(profile.activity_level) if profile else None,
-                        "notes": [
-                            "한국어로만 작성한다.",
-                            "1일치(1일) 식단을 제공한다.",
-                            "각 일자는 아침/점심/저녁으로 구성한다.",
-                            "일일 총칼로리는 목표 칼로리 ±5% 범위를 지향한다.",
-                            "식단 이름은 한국어로 자연스럽고 구체적으로 작성한다.",
-                            "영양값은 추정치이며 현실적인 범위로 작성한다.",
-                            "요즘 한국에서 많이 먹는 대중적이고 익숙한 메뉴 위주로 구성한다.",
-                            "지나치게 방대한 메뉴 구성을 피하고 현실적으로 준비 가능한 수준으로 제안한다.",
-                        ],
-                    }
-                    plan = generate_one_day_plan(prompt)
-                    db.add(
-                        UserDietPlan(
-                            user_number=user.user_number,
-                            goal_type=goal_type,
-                            target_calorie=target_calorie,
-                            plan_json=json.dumps(plan.model_dump(), ensure_ascii=False),
-                        )
-                    )
 
         db.add(new_record)
 
