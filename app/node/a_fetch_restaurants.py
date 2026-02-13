@@ -97,6 +97,14 @@ def _upsert_snapshot(db: Session, location_profile_id: int, restaurant_id: int, 
     db.flush()
 
 
+def _safe_distance(place: dict) -> float:
+    try:
+        value = place.get("distance")
+        return float(value) if value is not None else 999999.0
+    except Exception:
+        return 999999.0
+
+
 def node_a_fetch_restaurants(state: AgentState) -> AgentState:
     """Node A: GPS 좌표(우선) 또는 주소 기반 음식점 마스터 + 스냅샷 수집."""
     max_restaurants = 5
@@ -134,13 +142,14 @@ def node_a_fetch_restaurants(state: AgentState) -> AgentState:
             address_text = f"gps:{lat:.6f},{lng:.6f}"
 
         profile = _upsert_location_profile(db, user_number, label, address_text, lat, lng)
+        places = kakao_search_restaurants(lat, lng, radius_m)
+        selected_places = sorted(places, key=_safe_distance)[:max_restaurants]
 
-        places = kakao_search_restaurants(lat, lng, radius_m)[:max_restaurants]
         print(f"[A] user_number={user_number} label={label} coords=({lat},{lng}) radius_m={radius_m}")
         print(f"[A] kakao_places_count={len(places)} max_restaurants={max_restaurants}")
         restaurant_ids: List[int] = []
         sampled_names: List[str] = []
-        for place in places:
+        for place in selected_places:
             if not place.get("id") or not place.get("place_name"):
                 continue
             restaurant = _upsert_restaurant(db, place)
@@ -159,7 +168,7 @@ def node_a_fetch_restaurants(state: AgentState) -> AgentState:
         state["location_profile_id"] = profile.location_id
         state["lat"] = lat
         state["lng"] = lng
-        state["restaurant_ids"] = sorted(set(restaurant_ids))
+        state["restaurant_ids"] = list(dict.fromkeys(restaurant_ids))
         return state
     except Exception as exc:
         db.rollback()
