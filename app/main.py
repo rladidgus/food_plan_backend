@@ -13,7 +13,6 @@ from fastapi.responses import RedirectResponse
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, status, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from app.food_lens import decide_food_gpt_only
 from app.database import get_db, engine, Base
@@ -32,6 +31,39 @@ from app.models import (
     UserDietPlan,
 )
 from app.goal_rules import estimate_target_calorie, normalize_activity_level, ACTIVITY_FACTORS, infer_goal_type
+from app.schemas import (
+    ActivityLevelUpdateRequest,
+    AuthResponse,
+    BodyTypeFromUserRequest,
+    CalendarMarkedDatesResponse,
+    DailyActivityIn,
+    DailyActivityUpsertResult,
+    DietPlan3DaysRequest,
+    DietPlanContextRequest,
+    DietPlanPlaceItem,
+    DietPlanPlacesRequest,
+    DietPlanPlacesResponse,
+    DietPlanWithIntakeResponse,
+    DietRecordRequest,
+    DietRecordResponse,
+    InBodyHistoryResponse,
+    InBodyOcrResponse,
+    LogoutResponse,
+    MyPageEnvelopeResponse,
+    MyPageResponse,
+    PlanMealRecordIn,
+    PlanRecordCreateRequest,
+    PlanRecordCreateResult,
+    RecordDeleteResponse,
+    SocialCheckRequest,
+    SocialCheckResponse,
+    SocialRegisterRequest,
+    TodayIntakeResponse,
+    UserGoalResponse,
+    UserGoalUpdateRequest,
+    UserGoalWithPlanResponse,
+    UserResponse,
+)
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from supabase import create_client, Client
 import requests
@@ -102,231 +134,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Pydantic 모델 (요청/응답 스키마)
-class DietRecordRequest(BaseModel):
-    """식단 기록 요청 모델"""
-    goal_calories: int
-
-class DietRecordResponse(BaseModel):
-    """식단 기록 응답 모델"""
-    food_name: str
-    calories: int
-    message: str
-
-class UserResponse(BaseModel):
-    """사용자 기본 정보 응답"""
-    user_number: int
-    id: str
-    username: str
-    email: Optional[str] = None
-    role: Optional[str] = None
-
-    class Config:
-        from_attributes = True
-
-
-class AuthResponse(BaseModel):
-    user_number: int
-    id: str
-    username: str
-    message: str
-    has_inbody: Optional[bool] = None
-
-
-class UserGoalResponse(BaseModel):
-    """사용자 목표 응답"""
-    goal_id: int
-    goal_type: str
-    target_calorie: Optional[float] = None
-    target_protein: Optional[float] = None
-    target_carb: Optional[float] = None
-    target_fat: Optional[float] = None
-    target_macros: Optional[str] = None
-    target_pace: Optional[str] = None
-    start_date: Optional[str] = None
-    end_date: Optional[str] = None
-    created_at: Optional[str] = None
-
-    class Config:
-        from_attributes = True
-
-
-class MyPageResponse(BaseModel):
-    """마이페이지 식단 기록 응답 모델"""
-    id: int
-    goal_calories: int
-    food_name: str
-    calories: int
-    record_created_at: str
-    height: Optional[float] = None
-    weight: Optional[float] = None
-    skeletal_muscle_mass: Optional[float] = None
-    body_fat_percent: Optional[float] = None
-
-    class Config:
-        from_attributes = True
-
-
-class MyPageEnvelopeResponse(BaseModel):
-    """마이페이지 응답 모델 (목표 + 식단 기록)"""
-    user: Optional[UserResponse] = None
-    goal: Optional[UserGoalResponse] = None
-    body: Optional[dict] = None
-    records: List[MyPageResponse]
-
-
-class UserGoalUpdateRequest(BaseModel):
-    """사용자 목표 변경 요청"""
-    user_number: Optional[int] = None
-    goal_type: str
-    target_calorie: Optional[float] = None
-
-
-class DietPlan3DaysRequest(BaseModel):
-    """3일 식단 추천 요청"""
-    user_number: Optional[int] = None
-    id: Optional[str] = None
-    goal_type: Optional[str] = None
-    target_calorie: Optional[float] = None
-
-
-class DietPlanContextRequest(BaseModel):
-    """상황 기반 식단 추천 요청"""
-    context: str
-    target_calorie: Optional[float] = None
-
-
-class PlanMealRecordIn(BaseModel):
-    meal_type: str
-    name: str
-    calories_kcal: float
-    carbs_g: float
-    protein_g: float
-    fat_g: float
-
-
-class PlanRecordCreateRequest(BaseModel):
-    user_number: Optional[int] = None
-    id: Optional[str] = None
-    record_date: Optional[str] = None  # YYYY-MM-DD, default: today
-    meals: List[PlanMealRecordIn]
-
-
-class PlanRecordCreateResult(BaseModel):
-    record_ids: List[int]
-
-
-class TodayIntakeResponse(BaseModel):
-    goal_type: str
-    target_calorie: Optional[float] = None
-    total_calories_kcal: int
-    total_carbs_g: float
-    total_protein_g: float
-    total_fat_g: float
-    plan_date: Optional[str] = None
-
-
-class UserGoalWithPlanResponse(UserGoalResponse):
-    """사용자 목표 변경 응답 (목표 + 최신 식단)"""
-    plan: Optional[OneDayMealPlan] = None
-    today_intake: Optional[TodayIntakeResponse] = None
-
-
-class DietPlanWithIntakeResponse(BaseModel):
-    plan: OneDayMealPlan
-    today_intake: TodayIntakeResponse
-
-
-class CalendarMarkedDatesResponse(BaseModel):
-    year: int
-    month: int
-    dates: List[str]
-
-
-class DietPlanPlacesRequest(BaseModel):
-    food_name: Optional[str] = None
-    lat: float
-    lng: float
-    radius_m: Optional[int] = 2000
-
-
-class DietPlanPlaceItem(BaseModel):
-    id: str
-    name: str
-    category_group_code: Optional[str] = None
-    category_group_name: Optional[str] = None
-    category_name: Optional[str] = None
-    address_name: Optional[str] = None
-    road_address_name: Optional[str] = None
-    phone: Optional[str] = None
-    place_url: Optional[str] = None
-    distance_m: Optional[int] = None
-    x: float
-    y: float
-
-
-class DietPlanPlacesResponse(BaseModel):
-    places: List[DietPlanPlaceItem]
-
-
-
-class ActivityLevelUpdateRequest(BaseModel):
-    user_number: Optional[int] = None
-    activity_level: str
-
-
-class InBodyHistoryResponse(BaseModel):
-    """인바디 히스토리 응답"""
-    inbody_id: int
-    measurement_date: Optional[str] = None
-    height: Optional[float] = None
-    weight: Optional[float] = None
-    body_fat_pct: Optional[float] = None
-    skeletal_muscle_mass: Optional[float] = None
-    predicted_classify: Optional[int] = None
-    classify_name: Optional[str] = None
-    values: Optional[dict] = None
-    created_at: str
-    
-    class Config:
-        from_attributes = True
-
-
-class InBodyOcrResponse(BaseModel):
-    """인바디 OCR 응답"""
-    raw_text: str
-    text: str
-    values: dict
-    updated: bool
-    activity_level: Optional[str] = None
-    activity_level_options: Optional[dict] = None
-
-
-class DailyActivityIn(BaseModel):
-    user_number: Optional[int] = None
-    activity_date: date
-    activity_type: str
-    steps: Optional[int] = None
-    active_kcal: Optional[float] = None
-    total_kcal: Optional[float] = None
-    workout_minutes: Optional[int] = None
-    distance_meters: Optional[float] = None
-    activity_source: Optional[str] = None
-    activity_source_device: Optional[str] = None
-    activity_source_app: Optional[str] = None
-    activity_source_record_id: Optional[str] = None
-    activity_created_at: Optional[datetime] = None
-    activity_updated_at: Optional[datetime] = None
-
-
-class DailyActivityUpsertResult(BaseModel):
-    activity_id: int
-    created: bool
-
-    class Config:
-        from_attributes = True
-
-
 def _normalize_activity(item: DailyActivityIn) -> DailyActivityIn:
     data = item.model_dump()
 
@@ -362,11 +169,6 @@ def _normalize_activity(item: DailyActivityIn) -> DailyActivityIn:
     return DailyActivityIn(**data)
 
 
-class BodyTypeFromUserRequest(BaseModel):
-    user_number: Optional[int] = None
-
-
-
 # DB 테이블 생성
 @app.on_event("startup")
 def startup_event():
@@ -384,16 +186,6 @@ def root():
         "message": "식단 계획 AI API 서버가 정상 작동 중입니다!",
         "version": "1.0.0"
     }
-
-
-class LogoutResponse(BaseModel):
-    message: str
-
-
-class RecordDeleteResponse(BaseModel):
-    """식단 기록 삭제 응답"""
-    record_id: int
-    message: str
 
 
 def _normalize_goal_type(value: Optional[str]) -> Optional[str]:
@@ -657,31 +449,6 @@ async def get_current_user_from_token(
             detail="인증에 실패했습니다."
         )
 # --- Social Login & Registration ---
-
-class SocialCheckRequest(BaseModel):
-    access_token: str
-
-class SocialCheckResponse(BaseModel):
-    registered: bool
-    user_number: Optional[int] = None
-    id: Optional[str] = None
-    username: Optional[str] = None
-    message: Optional[str] = None
-    email: Optional[str] = None
-    provider_user_id: Optional[str] = None
-    suggested_username: Optional[str] = None
-    has_inbody: Optional[bool] = None
-    next_path: Optional[str] = None
-
-class SocialRegisterRequest(BaseModel):
-    access_token: str
-    username: str
-    height: Optional[float] = None
-    weight: Optional[float] = None
-    gender: Optional[str] = None
-    age: Optional[int] = None
-    activity_level: Optional[str] = None
-    goal_type: Optional[str] = "maintain"
 
 
 def _fallback_user_id(provider_user_id: Optional[str], email: Optional[str]) -> str:
