@@ -10,6 +10,7 @@ class AgentState(TypedDict, total=False):
     # 입력
     user_number: int
     label: str  # home | work
+    goal_type: str  # diet | maintain | bulk
     address_text: str
     lat: float
     lng: float
@@ -79,11 +80,46 @@ class NodeRunRequest(BaseModel):
     radius_m: Optional[int] = 500
 
 
+class NutritionFactsOut(BaseModel):
+    nutrition_id: Optional[int] = None
+    calories_kcal: Optional[float] = None
+    carbs_g: Optional[float] = None
+    protein_g: Optional[float] = None
+    fat_g: Optional[float] = None
+    sodium_mg: Optional[float] = None
+    sugar_g: Optional[float] = None
+    fiber_g: Optional[float] = None
+    source_type: Optional[str] = None
+    source_ref: Optional[str] = None
+    confidence: Optional[float] = None
+
+
+class NearbyMenuOut(BaseModel):
+    menu_id: int
+    name: str
+    description: Optional[str] = None
+    price: Optional[float] = None
+    source_url: Optional[str] = None
+    nutrition: Optional[NutritionFactsOut] = None
+
+
+class NearbyRestaurantOut(BaseModel):
+    restaurant_id: int
+    name: str
+    category: Optional[str] = None
+    address_text: Optional[str] = None
+    place_url: Optional[str] = None
+    distance_m: Optional[float] = None
+    menus: List[NearbyMenuOut] = Field(default_factory=list)
+
+
 class NodeRunResponse(BaseModel):
     user_number: int
     label: str
+    goal_type: Optional[str] = None
     location_profile_id: Optional[int] = None
     restaurant_ids: List[int] = Field(default_factory=list)
     menu_item_ids: List[int] = Field(default_factory=list)
     nutrition_ids: List[int] = Field(default_factory=list)
+    restaurants: List[NearbyRestaurantOut] = Field(default_factory=list)
     errors: List[str] = Field(default_factory=list)

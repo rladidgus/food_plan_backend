@@ -10,8 +10,10 @@ from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
 from app.models import MenuItem, Restaurant
-from app.node.external_clients import get_tavily_api_key, tavily_search
+from app.node.external_clients import get_serper_api_key, serper_search
 from app.schemas import AgentState, MenuCandidate
+
+MAX_MENUS_PER_RESTAURANT = 5
 
 
 class ParsedMenuItem(BaseModel):
@@ -41,7 +43,7 @@ def _build_menu_query(state: AgentState, restaurant: Restaurant) -> str:
     address = (state.get("address_text") or "").strip()
     lat = state.get("lat")
     lng = state.get("lng")
-    parts = [restaurant.name, "메뉴", "가격"]
+    parts = [restaurant.name, "메뉴", "가격", "네이버"]
     if address:
         parts.append(f"{address} 근처")
     if lat is not None and lng is not None:
@@ -49,14 +51,14 @@ def _build_menu_query(state: AgentState, restaurant: Restaurant) -> str:
     return " ".join(parts)
 
 
-def _parse_with_gpt(restaurant: Restaurant, query: str, tavily_results: List[dict]) -> List[MenuCandidate]:
-    if not tavily_results:
+def _parse_with_gpt(restaurant: Restaurant, query: str, search_results: List[dict]) -> List[MenuCandidate]:
+    if not search_results:
         return []
 
     client = _get_openai_client()
 
     condensed = []
-    for row in tavily_results[:8]:
+    for row in search_results[:8]:
         condensed.append(
             {
                 "title": row.get("title"),
@@ -95,9 +97,9 @@ def _parse_with_gpt(restaurant: Restaurant, query: str, tavily_results: List[dic
     if not parsed or not parsed.items:
         return []
 
-    source_url = tavily_results[0].get("url")
+    source_url = search_results[0].get("url")
     out: List[MenuCandidate] = []
-    for item in parsed.items[:15]:
+    for item in parsed.items[:MAX_MENUS_PER_RESTAURANT]:
         name = (item.name or "").strip()
         if not name:
             continue
@@ -114,10 +116,10 @@ def _parse_with_gpt(restaurant: Restaurant, query: str, tavily_results: List[dic
 
 def _extract_menu_candidates(state: AgentState, restaurant: Restaurant) -> List[MenuCandidate]:
     query = _build_menu_query(state, restaurant)
-    tavily_key = get_tavily_api_key()
-    results = tavily_search(query=query, max_results=6, api_key=tavily_key)
+    serper_key = get_serper_api_key()
+    results = serper_search(query=query, max_results=6, api_key=serper_key, naver_only=True)
     print(f"[B] restaurant={restaurant.restaurant_id}:{restaurant.name} query={query}")
-    print(f"[B] tavily_results_count={len(results)}")
+    print(f"[B] serper_naver_results_count={len(results)}")
     return _parse_with_gpt(restaurant, query, results)
 
 
@@ -156,13 +158,14 @@ def _get_existing_menu_ids(db: Session, restaurant_id: int) -> List[int]:
         db.query(MenuItem)
         .filter(MenuItem.restaurant_id == restaurant_id)
         .order_by(MenuItem.menu_id.asc())
+        .limit(MAX_MENUS_PER_RESTAURANT)
         .all()
     )
     return [m.menu_id for m in menus]
 
 
 def node_b_fetch_menus(state: AgentState) -> AgentState:
-    """Node B: DB 우선 메뉴 조회, 없으면 Tavily+GPT 파싱 후 menu_items upsert."""
+    """Node B: DB 우선 메뉴 조회, 없으면 Serper+GPT 파싱 후 menu_items upsert."""
     restaurant_ids = [int(x) for x in (state.get("restaurant_ids") or [])]
     if not restaurant_ids:
         _append_error(state, "restaurant_ids가 비어 있어 Node B를 건너뜁니다.")
@@ -194,11 +197,15 @@ def node_b_fetch_menus(state: AgentState) -> AgentState:
                 continue
             print(f"[B] parsed_candidates_count={len(candidates)} sample={candidates[:3]}")
 
+            inserted_count = 0
             for candidate in candidates:
                 if not candidate.get("name"):
                     continue
                 menu = _upsert_menu_item(db, restaurant.restaurant_id, candidate)
                 menu_item_ids.append(menu.menu_id)
+                inserted_count += 1
+                if inserted_count >= MAX_MENUS_PER_RESTAURANT:
+                    break
 
         db.commit()
         state["menu_item_ids"] = sorted(set(menu_item_ids))

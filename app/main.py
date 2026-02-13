@@ -22,13 +22,26 @@ from app.models import Record, InBodyRecord, User, UserProfile, FoodAnalysisResu
 from typing import List, Optional
 from app import models
 from app.inbody_ocr import extract_key_values, format_key_values, upstage_ocr_from_bytes, update_user_inbody
-from app.models import Record, InBodyRecord, User, UserProfile, UserGoal, DailyActivity, UserDietPlan
+from app.models import (
+    Record,
+    InBodyRecord,
+    User,
+    UserProfile,
+    UserGoal,
+    DailyActivity,
+    UserDietPlan,
+    Restaurant,
+    RestaurantSnapshot,
+    MenuItem,
+    NutritionFacts,
+)
 from app.goal_rules import estimate_target_calorie, normalize_activity_level, ACTIVITY_FACTORS, infer_goal_type
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from supabase import create_client, Client
 import requests
 from app.meal_plan_ai import MealPlanItem, DayMealPlan, OneDayMealPlan, generate_one_day_plan
 from app.agent_graph import build_graph
+from app.vector_store import ensure_food_master_indexed, search_goal_foods
 from app.schemas import (
     FetchNutritionRequest,
     FetchNutritionResponse,
@@ -202,6 +215,20 @@ class PlanRecordCreateRequest(BaseModel):
 
 class PlanRecordCreateResult(BaseModel):
     record_ids: List[int]
+
+
+class MenuSelectionRequest(BaseModel):
+    menu_item_id: int
+    meal_type: str = "lunch"
+    reason_text: Optional[str] = None
+
+
+class MenuSelectionResponse(BaseModel):
+    recommendation_id: int
+    user_number: int
+    menu_item_id: int
+    meal_type: str
+    created_at: str
 
 
 class TodayIntakeResponse(BaseModel):
@@ -401,6 +428,235 @@ def _normalize_goal_type(value: Optional[str]) -> Optional[str]:
         "증량": "bulk",
     }
     return goal_type_map.get(raw, raw)
+
+
+def _resolve_goal_type_for_user(db: Session, user_number: int) -> str:
+    latest_goal = (
+        db.query(UserGoal)
+        .filter(UserGoal.user_number == user_number)
+        .order_by(UserGoal.created_at.desc())
+        .first()
+    )
+    if latest_goal and latest_goal.goal_type:
+        value = _normalize_goal_type(latest_goal.goal_type)
+        if value in {"diet", "maintain", "bulk"}:
+            return value
+
+    profile = (
+        db.query(UserProfile)
+        .filter(UserProfile.user_number == user_number)
+        .first()
+    )
+    if profile and profile.goal_type:
+        value = _normalize_goal_type(profile.goal_type)
+        if value in {"diet", "maintain", "bulk"}:
+            return value
+
+    latest_inbody = (
+        db.query(InBodyRecord)
+        .filter(InBodyRecord.user_number == user_number)
+        .order_by(InBodyRecord.created_at.desc())
+        .first()
+    )
+    if latest_inbody and latest_inbody.classify_name:
+        value = _normalize_goal_type(infer_goal_type("", latest_inbody.classify_name))
+        if value in {"diet", "maintain", "bulk"}:
+            return value
+
+    return "maintain"
+
+
+def _estimate_calories_from_nutrition(nutrition: Optional[dict]) -> Optional[float]:
+    if not nutrition:
+        return None
+    calories = nutrition.get("calories_kcal")
+    if calories is not None:
+        return float(calories)
+
+    carbs = nutrition.get("carbs_g")
+    protein = nutrition.get("protein_g")
+    fat = nutrition.get("fat_g")
+    if carbs is None or protein is None or fat is None:
+        return None
+    return float(carbs) * 4.0 + float(protein) * 4.0 + float(fat) * 9.0
+
+
+def _normalize_food_text(value: str) -> str:
+    return re.sub(r"\s+", "", (value or "").strip().lower())
+
+
+def _load_vector_preference_foods(user_number: int, goal_type: str) -> List[str]:
+    _ = user_number
+    try:
+        ensure_food_master_indexed("final_food_db_v4.csv")
+        goal_queries = {
+            "diet": "가벼운 일식 초밥 저칼로리 양식 샐러드",
+            "bulk": "단백질 많은 중식 요리 고탄수화물 양식 파스타",
+            "maintain": "균형잡힌 한식 정식",
+        }
+        rows = search_goal_foods(
+            goal_type=goal_type,
+            query_text=goal_queries.get(goal_type, goal_queries["maintain"]),
+            n_results=10,
+        )
+        out: List[str] = []
+        for row in rows:
+            name = str((row or {}).get("food_name") or "").strip()
+            if not name:
+                continue
+            out.append(name)
+        return out
+    except Exception as exc:
+        logger.warning("vector preference load failed: %s", exc)
+        return []
+
+
+def _menu_goal_score(goal_type: str, menu_view: dict, preferred_foods: List[str]) -> float:
+    nutrition = menu_view.get("nutrition")
+    calories = _estimate_calories_from_nutrition(nutrition)
+    if not nutrition or calories is None:
+        base_score = -1_000_000.0
+    else:
+        protein = float(nutrition.get("protein_g") or 0.0)
+        fat = float(nutrition.get("fat_g") or 0.0)
+        carbs = float(nutrition.get("carbs_g") or 0.0)
+
+        if goal_type == "diet":
+            base_score = (-calories * 0.8) + (protein * 8.0) - (fat * 1.2)
+        elif goal_type == "bulk":
+            base_score = (calories * 0.7) + (protein * 7.0) + (carbs * 0.7)
+        else:
+            # maintain
+            base_score = (-abs(calories - 550.0) * 0.6) + (protein * 6.0)
+
+    menu_name_norm = _normalize_food_text(str(menu_view.get("name") or ""))
+    vector_bonus = 0.0
+    for food in preferred_foods:
+        pref_norm = _normalize_food_text(food)
+        if not pref_norm:
+            continue
+        if pref_norm in menu_name_norm or menu_name_norm in pref_norm:
+            vector_bonus += 40.0
+            break
+
+    return base_score + vector_bonus
+
+
+def _build_restaurant_menu_nutrition_view(
+    db: Session,
+    user_number: int,
+    location_profile_id: Optional[int],
+    restaurant_ids: List[int],
+    menu_item_ids: List[int],
+    goal_type: str,
+) -> List[dict]:
+    if not restaurant_ids:
+        return []
+
+    limited_restaurant_ids = list(dict.fromkeys(restaurant_ids))[:5]
+    restaurants = (
+        db.query(Restaurant)
+        .filter(Restaurant.restaurant_id.in_(limited_restaurant_ids))
+        .all()
+    )
+    restaurant_map = {row.restaurant_id: row for row in restaurants}
+
+    distance_map = {}
+    if location_profile_id is not None:
+        snapshots = (
+            db.query(RestaurantSnapshot)
+            .filter(
+                RestaurantSnapshot.location_profile_id == location_profile_id,
+                RestaurantSnapshot.restaurant_id.in_(limited_restaurant_ids),
+            )
+            .all()
+        )
+        for snapshot in snapshots:
+            distance_map[snapshot.restaurant_id] = snapshot.distance_m
+
+    menus = []
+    if menu_item_ids:
+        menus = (
+            db.query(MenuItem)
+            .filter(MenuItem.menu_id.in_(menu_item_ids))
+            .all()
+        )
+
+    latest_nutrition_by_menu = {}
+    if menus:
+        menu_ids = [menu.menu_id for menu in menus]
+        nutrition_rows = (
+            db.query(NutritionFacts)
+            .filter(NutritionFacts.menu_item_id.in_(menu_ids))
+            .order_by(NutritionFacts.menu_item_id.asc(), NutritionFacts.nutrition_id.desc())
+            .all()
+        )
+        for row in nutrition_rows:
+            if row.menu_item_id not in latest_nutrition_by_menu:
+                latest_nutrition_by_menu[row.menu_item_id] = row
+
+    menus_by_restaurant = {}
+    for menu in menus:
+        nutrition = latest_nutrition_by_menu.get(menu.menu_id)
+        menu_view = {
+            "menu_id": menu.menu_id,
+            "name": menu.name,
+            "description": menu.description,
+            "price": menu.price,
+            "source_url": menu.source_url,
+            "nutrition": (
+                {
+                    "nutrition_id": nutrition.nutrition_id,
+                    "calories_kcal": nutrition.calories_kcal,
+                    "carbs_g": nutrition.carbs_g,
+                    "protein_g": nutrition.protein_g,
+                    "fat_g": nutrition.fat_g,
+                    "sodium_mg": nutrition.sodium_mg,
+                    "sugar_g": nutrition.sugar_g,
+                    "fiber_g": nutrition.fiber_g,
+                    "source_type": nutrition.source_type,
+                    "source_ref": nutrition.source_ref,
+                    "confidence": nutrition.confidence,
+                }
+                if nutrition
+                else None
+            ),
+        }
+        menus_by_restaurant.setdefault(menu.restaurant_id, []).append(menu_view)
+
+    preferred_foods = _load_vector_preference_foods(user_number=user_number, goal_type=goal_type)
+    for row in menus_by_restaurant.values():
+        row.sort(
+            key=lambda item: (_menu_goal_score(goal_type, item, preferred_foods), -item["menu_id"]),
+            reverse=True,
+        )
+
+    output: List[dict] = []
+    for restaurant_id in limited_restaurant_ids:
+        restaurant = restaurant_map.get(restaurant_id)
+        if restaurant is None:
+            continue
+        menus = menus_by_restaurant.get(restaurant.restaurant_id, [])[:5]
+        output.append(
+            {
+                "restaurant_id": restaurant.restaurant_id,
+                "name": restaurant.name,
+                "category": restaurant.category,
+                "address_text": restaurant.address_text,
+                "place_url": restaurant.place_url,
+                "distance_m": distance_map.get(restaurant.restaurant_id),
+                "menus": menus,
+            }
+        )
+
+    output.sort(
+        key=lambda item: (
+            item["distance_m"] is None,
+            item["distance_m"] if item["distance_m"] is not None else 10**9,
+            item["restaurant_id"],
+        )
+    )
+    return output
 
 
 def _fetch_pexels_image(query: str) -> Optional[str]:
@@ -2412,14 +2668,17 @@ def classify_by_user(
 def run_node_pipeline(
     payload: NodeRunRequest,
     current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
 ):
     if (payload.lat is None or payload.lng is None) and not (payload.address_text and payload.address_text.strip()):
         raise HTTPException(status_code=400, detail="lat/lng 또는 address_text 중 하나는 필수입니다.")
 
+    goal_type = _resolve_goal_type_for_user(db, current_user.user_number)
     graph = build_graph()
     state = {
         "user_number": current_user.user_number,
         "label": "current",
+        "goal_type": goal_type,
         "address_text": (payload.address_text or "").strip(),
         "lat": payload.lat,
         "lng": payload.lng,
@@ -2427,14 +2686,73 @@ def run_node_pipeline(
         "errors": [],
     }
     result = graph.invoke(state)
+    restaurant_ids = result.get("restaurant_ids", []) or []
+    menu_item_ids = result.get("menu_item_ids", []) or []
+    restaurants = _build_restaurant_menu_nutrition_view(
+        db=db,
+        user_number=current_user.user_number,
+        location_profile_id=result.get("location_profile_id"),
+        restaurant_ids=restaurant_ids,
+        menu_item_ids=menu_item_ids,
+        goal_type=goal_type,
+    )
+
     return NodeRunResponse(
         user_number=current_user.user_number,
         label=(result.get("label") or "current"),
+        goal_type=goal_type,
         location_profile_id=result.get("location_profile_id"),
-        restaurant_ids=result.get("restaurant_ids", []) or [],
-        menu_item_ids=result.get("menu_item_ids", []) or [],
+        restaurant_ids=restaurant_ids,
+        menu_item_ids=menu_item_ids,
         nutrition_ids=result.get("nutrition_ids", []) or [],
+        restaurants=restaurants,
         errors=result.get("errors", []) or [],
+    )
+
+
+@app.post("/api/node/select", response_model=MenuSelectionResponse)
+def save_selected_menu(
+    payload: MenuSelectionRequest,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    meal_type = (payload.meal_type or "").strip().lower()
+    if meal_type not in {"breakfast", "lunch", "dinner", "snack"}:
+        raise HTTPException(
+            status_code=400,
+            detail="meal_type은 breakfast/lunch/dinner/snack 중 하나여야 합니다.",
+        )
+
+    menu = (
+        db.query(MenuItem)
+        .filter(MenuItem.menu_id == payload.menu_item_id)
+        .one_or_none()
+    )
+    if menu is None:
+        raise HTTPException(status_code=404, detail="선택한 menu_item_id를 찾을 수 없습니다.")
+
+    row = models.MealRecommendation(
+        user_number=current_user.user_number,
+        meal_type=meal_type,
+        menu_item_id=menu.menu_id,
+        reason_text=(payload.reason_text or "").strip() or None,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+
+    created_at = row.created_at
+    if created_at is None:
+        created_at = datetime.now(timezone.utc)
+    elif created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+
+    return MenuSelectionResponse(
+        recommendation_id=row.recommendation_id,
+        user_number=row.user_number,
+        menu_item_id=row.menu_item_id,
+        meal_type=row.meal_type,
+        created_at=created_at.isoformat(),
     )
 
 
