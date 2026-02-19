@@ -68,6 +68,7 @@ from app.schemas import (
     PersonalizedMenuRequest,
     PersonalizedMenuResponse,
     RecordDeleteResponse,
+    RecommendRecordCreateRequest,
     SocialCheckRequest,
     SocialCheckResponse,
     SocialRegisterRequest,
@@ -382,7 +383,7 @@ def _is_likely_open_for_meal(candidate: dict, meal: str) -> bool:
     menu_name = str(candidate.get("menu_name") or "")
     merged = f"{restaurant_name} {restaurant_category} {menu_name}".lower()
 
-    # 시간대 무관: 주점/유흥/안주 중심 업종은 추천에서 제외
+    # 시간대 무관: 술집/주점 + 빙과류 중심 후보는 추천에서 제외
     blocked_always = (
         "술집",
         "주점",
@@ -398,6 +399,11 @@ def _is_likely_open_for_meal(candidate: dict, meal: str) -> bool:
         "선술집",
         "룸살롱",
         "클럽",
+        "아이스크림",
+        "빙수",
+        "젤라또",
+        "샤베트",
+        "프로즌요거트",
     )
     if _contains_any(merged, blocked_always):
         return False
@@ -1032,6 +1038,15 @@ def _safe_float(text: str) -> Optional[float]:
         return float(str(text).strip())
     except Exception:
         return None
+
+
+def _truncate_source_url(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return text[:500]
 
 
 def _safe_int_price(value: object) -> Optional[int]:
@@ -2080,7 +2095,7 @@ def _run_collector_pipeline(
                     description=(item.get("description") or "").strip() or None,
                     price=float(price),
                     source="search_or_llm",
-                    source_url=item.get("source_url") or restaurant.place_url,
+                    source_url=_truncate_source_url(item.get("source_url") or restaurant.place_url),
                 )
                 db.add(menu)
                 db.flush()
@@ -2090,7 +2105,7 @@ def _run_collector_pipeline(
                 menu.price = float(price)
                 menu.description = (item.get("description") or menu.description or "").strip() or None
                 menu.source = "search_or_llm"
-                menu.source_url = item.get("source_url") or restaurant.place_url
+                menu.source_url = _truncate_source_url(item.get("source_url") or restaurant.place_url)
 
             last = latest_nutrition_by_menu.get(menu.menu_id)
             same_as_last = (
@@ -2673,7 +2688,7 @@ def upsert_user_goal(
     }
 
 
-@app.post("/api/recommand/menu-save", response_model=PersonalizedMenuResponse)
+@app.post("/api/recommend/menu-save", response_model=PersonalizedMenuResponse)
 def generate_menu_save(
     payload: PersonalizedMenuRequest,
     current_user: User = Depends(get_current_user_from_token),
@@ -2688,35 +2703,40 @@ def generate_menu_save(
     daily_target_kcal = _goal_daily_target_kcal(tdee_kcal, goal_type)
     meal_targets = _meal_targets_from_daily(daily_target_kcal)
 
-    resolved_address_text = (payload.address_text or "").strip() or None
-    resolved_lat = payload.lat
-    resolved_lng = payload.lng
-    if not resolved_address_text and (resolved_lat is None or resolved_lng is None):
-        existing_location = _get_location_profile(db, current_user.user_number, label)
-        if existing_location and (existing_location.address_text or "").strip():
-            resolved_address_text = (existing_location.address_text or "").strip()
-    has_request_location = bool(resolved_address_text) or (
-        resolved_lat is not None and resolved_lng is not None
-    )
+    input_address_text = (payload.address_text or "").strip() or None
+    input_lat = payload.lat
+    input_lng = payload.lng
+    has_request_location = bool(input_address_text) or (input_lat is not None and input_lng is not None)
 
-    # 1) 요청에 위치가 있으면: 수집/저장 먼저 수행
-    collector_triggered = False
+    resolved_address_text = input_address_text
+    resolved_lat = input_lat
+    resolved_lng = input_lng
     if has_request_location:
-        collector_triggered = True
-        _run_collector_pipeline(
+        if resolved_lat is None or resolved_lng is None:
+            if not resolved_address_text:
+                raise HTTPException(status_code=400, detail="lat/lng 또는 address_text가 필요합니다.")
+            geo_lat, geo_lng = _kakao_geocode_address(resolved_address_text)
+            resolved_lat, resolved_lng = float(geo_lat), float(geo_lng)
+        if not resolved_address_text:
+            existing_location = _get_location_profile(db, current_user.user_number, label)
+            resolved_address_text = (
+                (existing_location.address_text.strip() if existing_location and existing_location.address_text else "")
+                or f"{resolved_lat:.6f},{resolved_lng:.6f}"
+            )
+        _upsert_location_profile(
             db=db,
-            user=current_user,
-            payload=CollectorRunRequest(
-                label=label,
-                address_text=resolved_address_text,
-                lat=resolved_lat,
-                lng=resolved_lng,
-                radius_m=requested_radius,
-                max_restaurants=100,
-            ),
+            user_number=current_user.user_number,
+            label=label,
+            address_text=resolved_address_text,
+            lat=float(resolved_lat),
+            lng=float(resolved_lng),
         )
+        db.flush()
 
-    # 2) 추천 조회: 요청 위치 없으면 기존 DB location_profiles 기반 조회
+    # 1) 기본은 DB 캐시 조회, 부족할 때만 collector 실행
+    collector_triggered = False
+
+    # 2) 추천 조회
     try:
         candidates = _query_verified_menu_candidates(
             db=db,
@@ -2733,14 +2753,17 @@ def generate_menu_save(
         raise
 
     used_radius = requested_radius
-    if len(candidates) < 9 and requested_radius < 1000:
+    if len(candidates) < 9:
         collector_triggered = True
-        used_radius = 1000
+        used_radius = 1000 if requested_radius < 1000 else requested_radius
         _run_collector_pipeline(
             db=db,
             user=current_user,
             payload=CollectorRunRequest(
                 label=label,
+                address_text=resolved_address_text,
+                lat=resolved_lat,
+                lng=resolved_lng,
                 radius_m=used_radius,
                 max_restaurants=100,
             ),
@@ -2876,6 +2899,96 @@ def create_records_from_plan(
     return {"record_ids": record_ids}
 
 
+@app.post("/api/recommend/record", response_model=PlanRecordCreateResult)
+def create_records_from_recommendation(
+    payload: RecommendRecordCreateRequest,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    """카카오맵 추천(menu-save) 메뉴 선택 항목을 오늘 기록으로 저장"""
+    user = current_user
+
+    if not payload.meals:
+        raise HTTPException(status_code=400, detail="meals가 비어 있습니다.")
+
+    record_day = datetime.now().date()
+    if payload.record_date:
+        try:
+            record_day = datetime.strptime(payload.record_date, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="record_date는 YYYY-MM-DD 형식이어야 합니다.")
+
+    allowed_meal_types = {"breakfast", "lunch", "dinner", "snack", "아침", "점심", "저녁", "간식"}
+    meal_type_alias = {
+        "아침": "breakfast",
+        "점심": "lunch",
+        "저녁": "dinner",
+        "간식": "snack",
+    }
+    meal_time_map = {
+        "breakfast": time(8, 0, 0),
+        "lunch": time(13, 0, 0),
+        "dinner": time(19, 0, 0),
+        "snack": time(16, 0, 0),
+    }
+
+    record_ids: List[int] = []
+    for meal in payload.meals:
+        raw_type = (meal.meal_type or "").strip().lower()
+        if raw_type not in allowed_meal_types:
+            raise HTTPException(status_code=400, detail="meal_type은 아침/점심/저녁/간식 중 하나여야 합니다.")
+        meal_type = meal_type_alias.get(raw_type, raw_type)
+
+        menu = (
+            db.query(
+                MenuItem.menu_id,
+                MenuItem.name.label("menu_name"),
+                Restaurant.name.label("restaurant_name"),
+                NutritionFacts.calories_kcal,
+                NutritionFacts.carbs_g,
+                NutritionFacts.protein_g,
+                NutritionFacts.fat_g,
+            )
+            .join(Restaurant, Restaurant.restaurant_id == MenuItem.restaurant_id)
+            .join(NutritionFacts, NutritionFacts.menu_item_id == MenuItem.menu_id)
+            .filter(MenuItem.menu_id == int(meal.menu_id))
+            .order_by(NutritionFacts.nutrition_id.desc())
+            .first()
+        )
+        if not menu:
+            raise HTTPException(status_code=404, detail=f"menu_id={meal.menu_id} 메뉴를 찾을 수 없습니다.")
+
+        nutrition_ok = all(
+            value is not None
+            for value in (menu.calories_kcal, menu.carbs_g, menu.protein_g, menu.fat_g)
+        )
+        if not nutrition_ok and any(
+            value is None for value in (meal.calories_kcal, meal.carbs_g, meal.protein_g, meal.fat_g)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=f"menu_id={meal.menu_id} 영양정보가 부족합니다. calories/carbs/protein/fat를 함께 보내주세요.",
+            )
+
+        food_name = (meal.name or "").strip() or f"{menu.restaurant_name} {menu.menu_name}".strip()
+        rec = Record(
+            user_number=user.user_number,
+            food_name=food_name,
+            food_calories=float(menu.calories_kcal if menu.calories_kcal is not None else meal.calories_kcal),
+            food_protein=float(menu.protein_g if menu.protein_g is not None else meal.protein_g),
+            food_carb=float(menu.carbs_g if menu.carbs_g is not None else meal.carbs_g),
+            food_fat=float(menu.fat_g if menu.fat_g is not None else meal.fat_g),
+            meal_type=meal_type,
+            record_created_at=datetime.combine(record_day, meal_time_map.get(meal_type, time(12, 0, 0))),
+        )
+        db.add(rec)
+        db.flush()
+        record_ids.append(rec.record_id)
+
+    db.commit()
+    return {"record_ids": record_ids}
+
+
 @app.get("/api/intake/today", response_model=TodayIntakeResponse)
 def get_today_intake_from_plan(
     current_user: User = Depends(get_current_user_from_token),
@@ -2904,6 +3017,7 @@ def get_today_intake_from_plan(
 
     day0 = days[0]
     goal_type = plan.get("goal_type") or plan_record.goal_type or "maintain"
+
     return {
         "goal_type": goal_type,
         "total_calories_kcal": int(day0.get("total_calories_kcal") or 0),

@@ -163,6 +163,23 @@ class PlanRecordCreateResult(BaseModel):
     record_ids: List[int]
 
 
+class RecommendMealRecordIn(BaseModel):
+    meal_type: str
+    menu_id: int
+    name: Optional[str] = None
+    calories_kcal: Optional[float] = None
+    carbs_g: Optional[float] = None
+    protein_g: Optional[float] = None
+    fat_g: Optional[float] = None
+
+
+class RecommendRecordCreateRequest(BaseModel):
+    user_number: Optional[int] = None
+    id: Optional[str] = None
+    record_date: Optional[str] = None
+    meals: List[RecommendMealRecordIn]
+
+
 class TodayIntakeResponse(BaseModel):
     goal_type: str
     target_calorie: Optional[float] = None
