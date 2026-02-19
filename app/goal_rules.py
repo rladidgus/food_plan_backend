@@ -8,6 +8,7 @@ ACTIVITY_FACTORS = {
     "light": 1.375,
     "moderate": 1.55,
     "active": 1.725,
+    "very_active": 1.9,
 }
 
 
@@ -18,14 +19,10 @@ def normalize_activity_level(level: Optional[str]) -> Optional[str]:
     alias = {
         "저활동": "sedentary",
         "가벼운활동": "light",
-        "가벼운 활동": "light",
-        "중간": "moderate",
         "보통": "moderate",
         "중간활동": "moderate",
-        "중간 활동": "moderate",
-        "높음": "active",
         "높은활동": "active",
-        "높은 활동": "active",
+        "선수급": "very_active",
     }
     return alias.get(value, value)
 

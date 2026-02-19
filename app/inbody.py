@@ -55,27 +55,24 @@ def thresholds(gender: Gender) -> Dict[str, Any]:
     운영용 현실 기준 (룰 기반)
     - BMI: 아시아 기준 정상 18.5~22.9, 비만 25+
     - 체지방률:
-        남: 정상 <=20, 경계 20~25, 비만 >=25
-        여: 정상 <=28, 경계 28~33, 비만 >=33
+        남: 정상 <=20, 비만 >=25
+        여: 정상 <=28, 비만 >=33
     - 근육지표:
         SMM_ratio = SMM / weight
-        남: 정상 하한 ~0.40, 여: ~0.35
+        남: 근육 부족 <0.40, 여: <0.35
     - FFMI:
-        남: 저근육 <17, 근육형 기준 >=19, 고근육 >=22
-        여: 저근육 <15, 근육형 기준 >=17, 고근육 >=20
+        남: 저근육 <17, 근육형 >=19
+        여: 저근육 <15, 근육형 >=17
     """
     if gender == "M":
         return dict(
             bf_normal_max=20.0,
             bf_obese_min=25.0,
-            bf_high_min=20.0,
 
-            smm_low_max=0.40,      # 이하면 근육 부족으로 간주(대략)
-            smm_high_min=0.45,     # 이하면 보통, 이상이면 근육 충분(선택적)
+            smm_low_max=0.40,      # 이하면 근육 부족으로 간주
 
             ffmi_low=17.0,
             ffmi_muscular=19.0,
-            ffmi_very_muscular=22.0,
 
             skinnyfat_bf_min=20.0,
             skinnyfat_smm_max=0.40,
@@ -86,14 +83,11 @@ def thresholds(gender: Gender) -> Dict[str, Any]:
         return dict(
             bf_normal_max=28.0,
             bf_obese_min=33.0,
-            bf_high_min=28.0,
 
             smm_low_max=0.35,
-            smm_high_min=0.40,
 
             ffmi_low=15.0,
             ffmi_muscular=17.0,
-            ffmi_very_muscular=20.0,
 
             skinnyfat_bf_min=28.0,
             skinnyfat_smm_max=0.35,
