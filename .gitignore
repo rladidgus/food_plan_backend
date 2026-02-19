@@ -14,7 +14,7 @@ chroma_data/
 # --- 보안 및 설정 (필수) ---
 # 비밀번호나 API 키가 담길 파일
 .env
-
+.env.local
 # --- 에디터 및 OS (선택) ---
 .vscode/
 .idea/

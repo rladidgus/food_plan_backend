@@ -810,17 +810,32 @@ def upsert_user_goal(
         ],
     }
 
+    # 목표를 먼저 DB에 저장 (AI 식단 생성 전에 커밋)
+    db.commit()
+
+    # AI 식단 생성 (실패해도 목표 저장은 유지됨)
+    plan = None
     try:
         plan = generate_one_day_plan(prompt, preferred_meals=preferred_meals)
-    except HTTPException:
-        raise
     except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"식단 생성 결과가 올바르지 않습니다. error={type(exc).__name__}: {exc}",
-        )
+        # AI 식단 생성 실패 시 목표만 저장하고 반환
+        return {
+            "goal_id": goal.goal_id,
+            "goal_type": goal.goal_type,
+            "target_calorie": goal.target_calorie,
+            "target_protein": goal.target_protein,
+            "target_carb": goal.target_carb,
+            "target_fat": goal.target_fat,
+            "target_macros": goal.target_macros,
+            "target_pace": goal.target_pace,
+            "start_date": goal.start_date.isoformat() if goal.start_date else None,
+            "end_date": goal.end_date.isoformat() if goal.end_date else None,
+            "created_at": goal.created_at.isoformat() if goal.created_at else None,
+            "plan": None,
+            "today_intake": None,
+        }
 
-    # 음식 이미지 URL 붙이기 (Pexels)
+    # AI 식단 생성 성공 시 이미지 URL 추가 및 식단 저장
     for day in plan.days:
         for meal in (day.breakfast, day.lunch, day.dinner):
             if not meal.image_url:
@@ -834,7 +849,6 @@ def upsert_user_goal(
             plan_json=json.dumps(plan.model_dump(), ensure_ascii=False),
         )
     )
-
     db.commit()
 
     day0 = plan.days[0]
@@ -859,7 +873,7 @@ def upsert_user_goal(
         "start_date": goal.start_date.isoformat() if goal.start_date else None,
         "end_date": goal.end_date.isoformat() if goal.end_date else None,
         "created_at": goal.created_at.isoformat() if goal.created_at else None,
-        "plan": plan,
+        "plan": plan.model_dump() if plan else None,
         "today_intake": today_intake,
     }
 

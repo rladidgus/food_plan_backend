@@ -82,11 +82,32 @@ def generate_one_day_plan(
     """
     preference_text = _build_preference_text(preferred_meals or [])
 
+    # 목표 칼로리 범위 및 끼니별 권장 칼로리 계산
+    target = prompt.get("target_calorie", 0) or 2000
+    min_cal = int(target * 0.95)
+    max_cal = int(target * 1.05)
+    
+    # 3끼 배분 예시 (3:4:3)
+    meal_ratio = [0.3, 0.4, 0.3]
+    meal_names = ["Breakfast", "Lunch", "Dinner"]
+    distribution_msg = []
+    for name, ratio in zip(meal_names, meal_ratio):
+        cal = int(target * ratio)
+        distribution_msg.append(f"- {name}: approx. {cal} kcal")
+    
+    distribution_text = "\n".join(distribution_msg)
+
     user_content = (
         "다음 정보를 바탕으로 1일치 식단을 추천해줘. "
         "지정된 JSON 스키마만 출력해.\n"
-        f"{json.dumps(prompt, ensure_ascii=False)}"
-        f"{preference_text}"
+        f"{json.dumps(prompt, ensure_ascii=False)}\n"
+        f"{preference_text}\n"
+        "\nIMPORTANT RULES (CRITICAL):\n"
+        f"1. Target Calorie: {target} kcal\n"
+        f"2. Strict Total Calorie Range: {min_cal} ~ {max_cal} kcal\n"
+        f"3. Suggested Meal Distribution:\n{distribution_text}\n"
+        "4. Sum of (breakfast + lunch + dinner) calories MUST strictly fall within the range above.\n"
+        "5. Do NOT output a lower value like 2000 kcal if the target is higher.\n"
     )
 
     resp = openai_client.beta.chat.completions.parse(
