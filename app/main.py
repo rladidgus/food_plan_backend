@@ -6,10 +6,12 @@ import asyncio
 import logging
 import time as time_module
 import re
+import math
 from datetime import date, datetime, timezone, time, timedelta
 from pathlib import Path
 from uuid import uuid4
 from sqlalchemy import and_, func
+from sqlalchemy.exc import IntegrityError
 from fastapi.responses import RedirectResponse
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, status, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -190,6 +192,52 @@ def _normalize_activity(item: DailyActivityIn) -> DailyActivityIn:
     return DailyActivityIn(**data)
 
 
+def _normalize_location_label(raw: Optional[str]) -> str:
+    label = (raw or "").strip().lower()
+    if label == "work":
+        return "company"
+    return label
+
+
+def _validate_location_label(raw: Optional[str]) -> str:
+    label = _normalize_location_label(raw)
+    if label not in {"home", "company"}:
+        raise HTTPException(status_code=400, detail="label은 home/company 중 하나여야 합니다.")
+    return label
+
+
+def _get_location_profile(
+    db: Session,
+    user_number: int,
+    label: str,
+) -> Optional[LocationProfile]:
+    profile = (
+        db.query(LocationProfile)
+        .filter(LocationProfile.user_number == user_number, LocationProfile.label == label)
+        .first()
+    )
+    if profile is None and label == "company":
+        profile = (
+            db.query(LocationProfile)
+            .filter(LocationProfile.user_number == user_number, LocationProfile.label == "work")
+            .first()
+        )
+    return profile
+
+
+def _migrate_work_to_company(db: Session, user_number: Optional[int] = None) -> int:
+    query = db.query(LocationProfile).filter(LocationProfile.label == "work")
+    if user_number is not None:
+        query = query.filter(LocationProfile.user_number == user_number)
+    updated = 0
+    for profile in query.all():
+        profile.label = "company"
+        updated += 1
+    if updated:
+        db.flush()
+    return updated
+
+
 # DB 테이블 생성
 @app.on_event("startup")
 def startup_event():
@@ -320,27 +368,135 @@ def _menu_score(candidate: dict, meal_target_kcal: int, goal_type: str) -> float
     return -calorie_penalty - macro_penalty - distance_penalty + confidence_bonus
 
 
+def _contains_any(text: str, keywords: tuple[str, ...]) -> bool:
+    base = (text or "").lower()
+    return any(keyword in base for keyword in keywords)
+
+
+def _is_likely_open_for_meal(candidate: dict, meal: str) -> bool:
+    """
+    실제 영업시간 API가 없어서, 업종/메뉴명 기반으로 시간대 부적합 후보를 제외한다.
+    """
+    restaurant_name = str(candidate.get("restaurant_name") or "")
+    restaurant_category = str(candidate.get("restaurant_category") or "")
+    menu_name = str(candidate.get("menu_name") or "")
+    merged = f"{restaurant_name} {restaurant_category} {menu_name}".lower()
+
+    # 시간대 무관: 주점/유흥/안주 중심 업종은 추천에서 제외
+    blocked_always = (
+        "술집",
+        "주점",
+        "호프",
+        "포차",
+        "이자카야",
+        "bar",
+        "pub",
+        "칵테일",
+        "와인바",
+        "맥주집",
+        "요리주점",
+        "선술집",
+        "룸살롱",
+        "클럽",
+    )
+    if _contains_any(merged, blocked_always):
+        return False
+
+    if meal == "breakfast":
+        blocked_breakfast = (
+            "참치",
+            "횟집",
+            "회",
+            "불고기",
+            "삼계탕",
+            "족발",
+            "보쌈",
+            "곱창",
+            "막창",
+            "곱창",
+            "닭발",
+            "양꼬치",
+            "삼겹살",
+            "고기집",
+            "안주",
+            "소주",
+            "하이볼",
+            "무한리필",
+        )
+        if _contains_any(merged, blocked_breakfast):
+            return False
+
+        # 아침에는 지나치게 헤비한 메뉴를 1차 제외
+        calories = float(candidate.get("calories_kcal") or 0.0)
+        if calories > 850:
+            return False
+    return True
+
+
+def _is_goal_compatible(candidate: dict, goal_type: str, meal_target_kcal: int) -> bool:
+    menu_name = str(candidate.get("menu_name") or "").lower()
+    calories = float(candidate.get("calories_kcal") or 0.0)
+    protein = float(candidate.get("protein_g") or 0.0)
+    fat = float(candidate.get("fat_g") or 0.0)
+
+    if goal_type == "diet":
+        blocked_menu_keywords = (
+            "버거",
+            "빅맥",
+            "튀김",
+            "돈까스",
+            "피자",
+            "라면",
+            "치킨",
+            "족발",
+            "삼겹",
+            "햄버거",
+        )
+        if _contains_any(menu_name, blocked_menu_keywords):
+            return False
+        if calories > meal_target_kcal * 1.10:
+            return False
+        if fat > 20:
+            return False
+        if protein < 16:
+            return False
+
+    return True
+
+
 def _query_verified_menu_candidates(
     db: Session,
     user_number: int,
     label: str,
     radius_m: int,
 ) -> list[dict]:
+    norm_label = _validate_location_label(label)
     location = (
         db.query(LocationProfile)
         .filter(
             LocationProfile.user_number == user_number,
-            LocationProfile.label == label,
+            LocationProfile.label == norm_label,
         )
         .first()
     )
+    if location is None and norm_label == "company":
+        location = (
+            db.query(LocationProfile)
+            .filter(
+                LocationProfile.user_number == user_number,
+                LocationProfile.label == "work",
+            )
+            .first()
+        )
     if location is None:
-        raise HTTPException(status_code=404, detail=f"{label} 위치 프로필이 없습니다.")
+        raise HTTPException(status_code=404, detail=f"{norm_label} 위치 프로필이 없습니다.")
 
     rows = (
         db.query(
             Restaurant.restaurant_id,
             Restaurant.name.label("restaurant_name"),
+            Restaurant.category.label("restaurant_category"),
+            Restaurant.place_url.label("place_url"),
             MenuItem.menu_id,
             MenuItem.name.label("menu_name"),
             MenuItem.price,
@@ -378,6 +534,8 @@ def _query_verified_menu_candidates(
         latest_by_menu[menu_id] = {
             "restaurant_id": int(row_map["restaurant_id"]),
             "restaurant_name": str(row_map["restaurant_name"]),
+            "restaurant_category": str(row_map.get("restaurant_category") or ""),
+            "place_url": str(row_map.get("place_url") or ""),
             "menu_id": menu_id,
             "menu_name": str(row_map["menu_name"]),
             "price": float(row_map["price"]),
@@ -553,15 +711,16 @@ def _kakao_geocode_address(address_text: str) -> tuple[float, float]:
         raise HTTPException(status_code=502, detail="Kakao Geocoding API 요청 실패")
 
 
-def _kakao_collect_restaurants(lat: float, lng: float, radius_m: int, max_count: int = 50) -> list[dict]:
+def _kakao_collect_restaurants(lat: float, lng: float, radius_m: int, max_count: int = 100) -> list[dict]:
     if not KAKAO_REST_API_KEY:
         raise HTTPException(status_code=500, detail="KAKAO_REST_API_KEY 환경변수가 필요합니다.")
 
     radius = max(50, min(int(radius_m), 20000))
-    target_count = max(1, min(int(max_count), 50))
+    target_count = max(1, min(int(max_count), 100))
     merged: dict[str, dict] = {}
 
-    for page in range(1, 6):
+    max_pages = min(45, max(1, (target_count + 14) // 15 + 1))
+    for page in range(1, max_pages + 1):
         try:
             resp = requests.get(
                 KAKAO_LOCAL_CATEGORY_API_URL,
@@ -606,6 +765,157 @@ def _kakao_collect_restaurants(lat: float, lng: float, radius_m: int, max_count:
     return ordered[:target_count]
 
 
+def _haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    r = 6371000.0
+    p1 = math.radians(float(lat1))
+    p2 = math.radians(float(lat2))
+    dp = math.radians(float(lat2) - float(lat1))
+    dl = math.radians(float(lng2) - float(lng1))
+    a = (math.sin(dp / 2.0) ** 2) + (math.cos(p1) * math.cos(p2) * (math.sin(dl / 2.0) ** 2))
+    c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(max(0.0, 1.0 - a)))
+    return r * c
+
+
+def _snapshot_cache_fresh_cutoff(now_utc: datetime) -> datetime:
+    # 기본 정책: 당일 00:00 이후 스냅샷만 재사용
+    use_daily = str(os.getenv("SNAPSHOT_CACHE_UNTIL_MIDNIGHT", "1")).strip().lower() in {"1", "true", "yes", "on"}
+    if use_daily:
+        kst = timezone(timedelta(hours=9))
+        local_now = now_utc.astimezone(kst)
+        day_start_local = datetime.combine(local_now.date(), time.min, tzinfo=kst)
+        return day_start_local.astimezone(timezone.utc)
+
+    ttl_minutes = max(10, min(int(os.getenv("SNAPSHOT_CACHE_TTL_MINUTES", "180")), 1440))
+    return now_utc - timedelta(minutes=ttl_minutes)
+
+
+def _load_restaurants_from_location_snapshots(
+    db: Session,
+    location_profile_id: int,
+    max_count: int,
+) -> list[Restaurant]:
+    rows = (
+        db.query(Restaurant)
+        .join(RestaurantSnapshot, RestaurantSnapshot.restaurant_id == Restaurant.restaurant_id)
+        .filter(RestaurantSnapshot.location_profile_id == location_profile_id)
+        .order_by(func.coalesce(RestaurantSnapshot.distance_m, 1e9).asc(), RestaurantSnapshot.snapshot_id.asc())
+        .limit(max_count)
+        .all()
+    )
+    return rows
+
+
+def _find_reusable_location_profile(
+    db: Session,
+    lat: float,
+    lng: float,
+    max_distance_m: int,
+    fresh_cutoff: datetime,
+    current_location_id: Optional[int] = None,
+) -> Optional[LocationProfile]:
+    profiles = (
+        db.query(LocationProfile)
+        .filter(LocationProfile.lat.isnot(None), LocationProfile.lng.isnot(None))
+        .all()
+    )
+    if not profiles:
+        return None
+
+    candidates: list[tuple[float, LocationProfile]] = []
+    for profile in profiles:
+        if profile.lat is None or profile.lng is None:
+            continue
+        try:
+            dist = _haversine_m(lat, lng, float(profile.lat), float(profile.lng))
+        except Exception:
+            continue
+        if dist <= float(max_distance_m):
+            candidates.append((dist, profile))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: (0 if (current_location_id and x[1].location_id == current_location_id) else 1, x[0]))
+
+    for _, profile in candidates:
+        latest_collected = (
+            db.query(func.max(RestaurantSnapshot.collected_at))
+            .filter(RestaurantSnapshot.location_profile_id == profile.location_id)
+            .scalar()
+        )
+        if latest_collected is None:
+            continue
+        if latest_collected.tzinfo is None:
+            latest_collected = latest_collected.replace(tzinfo=timezone.utc)
+        if latest_collected >= fresh_cutoff:
+            return profile
+    return None
+
+
+def _copy_snapshots_to_location(
+    db: Session,
+    source_location_id: int,
+    target_location: LocationProfile,
+    max_count: int,
+    collected_at: datetime,
+) -> list[Restaurant]:
+    rows = (
+        db.query(RestaurantSnapshot, Restaurant)
+        .join(Restaurant, Restaurant.restaurant_id == RestaurantSnapshot.restaurant_id)
+        .filter(RestaurantSnapshot.location_profile_id == source_location_id)
+        .order_by(func.coalesce(RestaurantSnapshot.distance_m, 1e9).asc(), RestaurantSnapshot.snapshot_id.asc())
+        .limit(max_count)
+        .all()
+    )
+    if not rows:
+        return []
+
+    restaurant_ids = [restaurant.restaurant_id for _, restaurant in rows]
+    existing_rows = (
+        db.query(RestaurantSnapshot)
+        .filter(
+            RestaurantSnapshot.location_profile_id == target_location.location_id,
+            RestaurantSnapshot.restaurant_id.in_(restaurant_ids),
+        )
+        .all()
+    )
+    existing_map = {row.restaurant_id: row for row in existing_rows}
+
+    out: list[Restaurant] = []
+    for source_snapshot, restaurant in rows:
+        distance_m = source_snapshot.distance_m
+        if (
+            target_location.lat is not None
+            and target_location.lng is not None
+            and restaurant.lat is not None
+            and restaurant.lng is not None
+        ):
+            try:
+                distance_m = _haversine_m(
+                    float(target_location.lat),
+                    float(target_location.lng),
+                    float(restaurant.lat),
+                    float(restaurant.lng),
+                )
+            except Exception:
+                pass
+
+        target_snapshot = existing_map.get(restaurant.restaurant_id)
+        if target_snapshot is None:
+            target_snapshot = RestaurantSnapshot(
+                location_profile_id=target_location.location_id,
+                restaurant_id=restaurant.restaurant_id,
+                distance_m=distance_m,
+                collected_at=collected_at,
+            )
+            db.add(target_snapshot)
+        else:
+            target_snapshot.distance_m = distance_m
+            target_snapshot.collected_at = collected_at
+        out.append(restaurant)
+    return out
+
+
 def _upsert_location_profile(
     db: Session,
     user_number: int,
@@ -614,15 +924,24 @@ def _upsert_location_profile(
     lat: float,
     lng: float,
 ) -> LocationProfile:
+    norm_label = _validate_location_label(label)
     profile = (
         db.query(LocationProfile)
-        .filter(LocationProfile.user_number == user_number, LocationProfile.label == label)
+        .filter(LocationProfile.user_number == user_number, LocationProfile.label == norm_label)
         .one_or_none()
     )
+    if profile is None and norm_label == "company":
+        profile = (
+            db.query(LocationProfile)
+            .filter(LocationProfile.user_number == user_number, LocationProfile.label == "work")
+            .one_or_none()
+        )
+        if profile is not None:
+            profile.label = "company"
     if profile is None:
         profile = LocationProfile(
             user_number=user_number,
-            label=label,
+            label=norm_label,
             address_text=address_text,
             lat=lat,
             lng=lng,
@@ -660,7 +979,18 @@ def _upsert_restaurant_and_snapshot(
             place_url=(kakao_doc.get("place_url") or "").strip() or None,
         )
         db.add(restaurant)
-        db.flush()
+        try:
+            with db.begin_nested():
+                db.flush()
+        except IntegrityError:
+            db.rollback()
+            restaurant = (
+                db.query(Restaurant)
+                .filter(Restaurant.source == "kakao", Restaurant.source_place_id == source_place_id)
+                .one_or_none()
+            )
+            if restaurant is None:
+                raise
     else:
         restaurant.name = (kakao_doc.get("place_name") or restaurant.name or "").strip()
         restaurant.category = kakao_doc.get("category_name") or kakao_doc.get("category_group_name") or restaurant.category
@@ -688,10 +1018,12 @@ def _upsert_restaurant_and_snapshot(
             location_profile_id=location_profile_id,
             restaurant_id=restaurant.restaurant_id,
             distance_m=distance_m,
+            collected_at=datetime.now(timezone.utc),
         )
         db.add(snapshot)
     else:
         snapshot.distance_m = distance_m
+        snapshot.collected_at = datetime.now(timezone.utc)
     return restaurant
 
 
@@ -700,6 +1032,119 @@ def _safe_float(text: str) -> Optional[float]:
         return float(str(text).strip())
     except Exception:
         return None
+
+
+def _safe_int_price(value: object) -> Optional[int]:
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    raw = re.sub(r"[^0-9]", "", raw)
+    if not raw:
+        return None
+    try:
+        price = int(raw)
+    except Exception:
+        return None
+    if price < 1000 or price > 200000:
+        return None
+    return price
+
+
+def _extract_kakao_place_id(place_url: str) -> Optional[str]:
+    url = (place_url or "").strip()
+    if not url:
+        return None
+    m = re.search(r"/([0-9]{6,})/?(?:[?#].*)?$", url)
+    if not m:
+        return None
+    return m.group(1)
+
+
+def _extract_menu_candidates_from_kakao_payload(payload: object, restaurant_name: str) -> list[dict]:
+    out: list[dict] = []
+    seen: set[tuple[str, int]] = set()
+    name_keys = ("menu", "menu_name", "menuname", "name", "title", "nm")
+    price_keys = ("price", "menu_price", "menuprice", "cost", "amount", "fee")
+
+    def pick_value(item: dict, keys: tuple[str, ...]) -> Optional[object]:
+        for key, value in item.items():
+            key_norm = str(key).strip().lower().replace(" ", "").replace("-", "_")
+            if key_norm in keys:
+                return value
+        return None
+
+    def add_candidate(name_raw: object, price_raw: object) -> None:
+        if name_raw is None or price_raw is None:
+            return
+        name = _sanitize_menu_name(str(name_raw), restaurant_name)
+        price = _safe_int_price(price_raw)
+        if price is None or not _is_valid_menu_name(name, restaurant_name):
+            return
+        key = (_normalize_menu_name(name), price)
+        if not key[0] or key in seen:
+            return
+        seen.add(key)
+        out.append(
+            {
+                "name": name,
+                "price": float(price),
+                "description": "kakao-place-menu",
+                "menu_confidence": 0.95,
+            }
+        )
+
+    def walk(node: object) -> None:
+        if isinstance(node, dict):
+            name_value = pick_value(node, name_keys)
+            price_value = pick_value(node, price_keys)
+            add_candidate(name_value, price_value)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(payload)
+    return out[:20]
+
+
+def _fetch_kakao_place_menu_candidates(restaurant: Restaurant) -> list[dict]:
+    place_url = (restaurant.place_url or "").strip()
+    place_id = _extract_kakao_place_id(place_url)
+    if not place_url or not place_id:
+        return []
+
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": place_url}
+    menus: list[dict] = []
+
+    # Kakao place 내부 JSON 엔드포인트(메뉴 탭 데이터 포함 가능)
+    try:
+        resp = requests.get(
+            f"https://place.map.kakao.com/main/v/{place_id}",
+            headers=headers,
+            timeout=6,
+        )
+        if resp.status_code == 200:
+            payload = resp.json()
+            menus = _extract_menu_candidates_from_kakao_payload(payload, restaurant.name or "")
+    except Exception as exc:
+        logger.warning("kakao place menu json parse failed place_id=%s error=%s", place_id, exc)
+
+    # JSON에서 못 뽑으면 place 페이지 본문에서 보조 추출
+    if not menus:
+        try:
+            resp = requests.get(place_url, headers=headers, timeout=6)
+            if resp.status_code == 200:
+                text = resp.text or ""
+                menus = _extract_menu_candidates_from_text(text, restaurant.name or "")
+        except Exception as exc:
+            logger.warning("kakao place menu html parse failed place_url=%s error=%s", place_url, exc)
+
+    for menu in menus:
+        menu["source_url"] = f"{place_url}#menu"
+    return menus[:10]
 
 
 def _search_web(query: str, max_results: int = 8) -> list[dict]:
@@ -1154,38 +1599,44 @@ def _llm_infer_menu_candidates(restaurant: Restaurant) -> list[dict]:
 
 
 def _collect_menus_for_restaurant(restaurant: Restaurant) -> list[dict]:
-    menus = [
-        m for m in _search_menu_candidates(restaurant)
-        if _is_valid_menu_name(str(m.get("name") or ""), restaurant.name or "")
-    ]
-    search_conf = _estimate_menu_set_confidence(menus)
-    min_conf = _safe_float(os.getenv("MENU_SEARCH_CONFIDENCE_MIN", "0.62")) or 0.62
+    merged: list[dict] = []
+    seen: set[tuple[str, int]] = set()
 
-    if not menus or search_conf < min_conf:
-        llm_menus = [
-            m for m in _llm_infer_menu_candidates(restaurant)
-            if _is_valid_menu_name(str(m.get("name") or ""), restaurant.name or "")
-        ]
-        if not menus:
-            return llm_menus[:10]
-        if llm_menus:
-            # 검색 결과가 매우 약하면 LLM 결과를 우선 사용
-            if search_conf < 0.35:
-                return llm_menus[:10]
+    def _append_valid(candidates: list[dict]) -> None:
+        for menu in candidates:
+            name = _sanitize_menu_name(str(menu.get("name") or "").strip(), restaurant.name or "")
+            if not _is_valid_menu_name(name, restaurant.name or ""):
+                continue
+            price_value = _safe_float(str(menu.get("price")))
+            if price_value is None or price_value < 1000:
+                continue
+            price = int(price_value)
+            key = (_normalize_menu_name(name), price)
+            if not key[0] or key in seen:
+                continue
+            seen.add(key)
+            merged.append(
+                {
+                    "name": name,
+                    "price": float(price),
+                    "description": menu.get("description"),
+                    "source_url": menu.get("source_url"),
+                    "menu_confidence": float(menu.get("menu_confidence") or 0.0),
+                }
+            )
+            if len(merged) >= 10:
+                return
 
-            merged = list(menus)
-            seen_norm = {_normalize_menu_name(str(m.get("name") or "")) for m in merged}
-            for menu in llm_menus:
-                norm = _normalize_menu_name(str(menu.get("name") or ""))
-                if not norm or norm in seen_norm:
-                    continue
-                merged.append(menu)
-                seen_norm.add(norm)
-                if len(merged) >= 10:
-                    break
-            return merged[:10]
+    # 1) Kakao place 메뉴
+    _append_valid(_fetch_kakao_place_menu_candidates(restaurant))
+    # 2) Web 검색 보조
+    if len(merged) < 3:
+        _append_valid(_search_menu_candidates(restaurant))
+    # 3) LLM 추정 보조
+    if len(merged) < 3:
+        _append_valid(_llm_infer_menu_candidates(restaurant))
 
-    return menus[:10]
+    return merged[:10]
 
 
 def _parse_nutrition_from_text(text: str) -> Optional[dict]:
@@ -1281,9 +1732,9 @@ def _llm_infer_nutrition(restaurant: Restaurant, menu_name: str, price: float) -
 
 
 def _resolve_nutrition(restaurant: Restaurant, menu_name: str, price: float) -> Optional[dict]:
-    by_search = _search_nutrition(restaurant, menu_name)
-    if by_search:
-        return by_search
+    searched = _search_nutrition(restaurant, menu_name)
+    if searched:
+        return searched
     return _llm_infer_nutrition(restaurant, menu_name, price)
 
 
@@ -1402,19 +1853,26 @@ def _collect_restaurant_payload_sync(restaurant: Restaurant, nutrition_cache: di
     skipped = 0
     menus = _collect_menus_for_restaurant(restaurant)
     if not menus:
+        logger.info(
+            "collector_skip restaurant_id=%s reason=no_menu_candidates",
+            restaurant.restaurant_id,
+        )
         return {"restaurant_id": restaurant.restaurant_id, "items": [], "skipped": 1}
 
     seen_menu_norm: set[str] = set()
     complete_items: list[dict] = []
+    reason_counts = {"invalid_menu": 0, "no_nutrition": 0, "low_confidence": 0, "missing_macros": 0}
     for menu in menus:
         menu_name = (menu.get("name") or "").strip()
         price = menu.get("price")
         if not menu_name or not restaurant.name or price is None:
             skipped += 1
+            reason_counts["invalid_menu"] += 1
             continue
         norm = _normalize_menu_name(menu_name)
         if not norm or norm in seen_menu_norm:
             skipped += 1
+            reason_counts["invalid_menu"] += 1
             continue
         seen_menu_norm.add(norm)
 
@@ -1423,12 +1881,15 @@ def _collect_restaurant_payload_sync(restaurant: Restaurant, nutrition_cache: di
             nutrition = _resolve_nutrition(restaurant, menu_name, float(price))
         if not nutrition:
             skipped += 1
+            reason_counts["no_nutrition"] += 1
             continue
         if nutrition.get("confidence", 0.0) < 0.6:
             skipped += 1
+            reason_counts["low_confidence"] += 1
             continue
         if any(nutrition.get(k) is None for k in ("calories_kcal", "carbs_g", "protein_g", "fat_g")):
             skipped += 1
+            reason_counts["missing_macros"] += 1
             continue
 
         complete_items.append(
@@ -1440,6 +1901,14 @@ def _collect_restaurant_payload_sync(restaurant: Restaurant, nutrition_cache: di
                 "nutrition": nutrition,
             }
         )
+    logger.info(
+        "collector_restaurant_result restaurant_id=%s menu_candidates=%s complete_items=%s skipped=%s reasons=%s",
+        restaurant.restaurant_id,
+        len(menus),
+        len(complete_items),
+        skipped,
+        reason_counts,
+    )
     return {"restaurant_id": restaurant.restaurant_id, "items": complete_items, "skipped": skipped}
 
 
@@ -1463,15 +1932,8 @@ def _run_collector_pipeline(
     user: User,
     payload: CollectorRunRequest,
 ) -> dict:
-    label = (payload.label or "").strip().lower()
-    if label not in {"home", "work"}:
-        raise HTTPException(status_code=400, detail="label은 home/work 중 하나여야 합니다.")
-
-    existing_location = (
-        db.query(LocationProfile)
-        .filter(LocationProfile.user_number == user.user_number, LocationProfile.label == label)
-        .one_or_none()
-    )
+    resolved_label = _validate_location_label(payload.label)
+    existing_location = _get_location_profile(db, user.user_number, resolved_label)
     if payload.lat is None or payload.lng is None:
         if payload.address_text and payload.address_text.strip():
             lat, lng = _kakao_geocode_address(payload.address_text)
@@ -1484,13 +1946,12 @@ def _run_collector_pipeline(
     else:
         lat, lng = float(payload.lat), float(payload.lng)
         address_text = (payload.address_text or (existing_location.address_text if existing_location else None) or f"{lat:.6f},{lng:.6f}").strip()
-    requested_radius = max(100, min(int(payload.radius_m or 500), 3000))
-    restaurants_raw = _kakao_collect_restaurants(lat, lng, requested_radius, payload.max_restaurants or 50)
+    requested_radius = max(100, min(int(payload.radius_m or 1000), 3000))
 
     location = _upsert_location_profile(
         db=db,
         user_number=user.user_number,
-        label=label,
+        label=resolved_label,
         address_text=address_text,
         lat=lat,
         lng=lng,
@@ -1499,13 +1960,54 @@ def _run_collector_pipeline(
     menus_saved = 0
     nutritions_saved = 0
     skipped = 0
+    cache_reused = False
+    max_restaurants = max(1, min(int(payload.max_restaurants or 100), 100))
 
     restaurants: list[Restaurant] = []
-    for raw in restaurants_raw:
-        if not raw.get("id") or not raw.get("place_name"):
-            skipped += 1
-            continue
-        restaurants.append(_upsert_restaurant_and_snapshot(db, location.location_id, raw))
+    now_utc = datetime.now(timezone.utc)
+    fresh_cutoff = _snapshot_cache_fresh_cutoff(now_utc)
+    cache_radius_m = max(50, min(int(os.getenv("LOCATION_CACHE_RADIUS_M", "250")), 3000))
+    reusable_profile = _find_reusable_location_profile(
+        db=db,
+        lat=lat,
+        lng=lng,
+        max_distance_m=cache_radius_m,
+        fresh_cutoff=fresh_cutoff,
+        current_location_id=int(location.location_id),
+    )
+    if reusable_profile is not None:
+        if reusable_profile.location_id == location.location_id:
+            restaurants = _load_restaurants_from_location_snapshots(
+                db=db,
+                location_profile_id=int(location.location_id),
+                max_count=max_restaurants,
+            )
+        else:
+            restaurants = _copy_snapshots_to_location(
+                db=db,
+                source_location_id=int(reusable_profile.location_id),
+                target_location=location,
+                max_count=max_restaurants,
+                collected_at=now_utc,
+            )
+        cache_reused = len(restaurants) > 0
+        logger.info(
+            "collector_cache_reuse location_id=%s source_location_id=%s cache_reused=%s restaurants=%s fresh_cutoff=%s radius_m=%s",
+            location.location_id,
+            reusable_profile.location_id,
+            cache_reused,
+            len(restaurants),
+            fresh_cutoff.isoformat(),
+            cache_radius_m,
+        )
+
+    if not restaurants:
+        restaurants_raw = _kakao_collect_restaurants(lat, lng, requested_radius, max_restaurants)
+        for raw in restaurants_raw:
+            if not raw.get("id") or not raw.get("place_name"):
+                skipped += 1
+                continue
+            restaurants.append(_upsert_restaurant_and_snapshot(db, location.location_id, raw))
     db.flush()
     restaurant_count = len(restaurants)
 
@@ -1618,7 +2120,7 @@ def _run_collector_pipeline(
 
     db.commit()
     return {
-        "label": label,
+        "label": resolved_label,
         "location_profile_id": int(location.location_id),
         "lat": float(lat),
         "lng": float(lng),
@@ -2158,23 +2660,30 @@ def upsert_user_goal(
 
 
 @app.post("/api/recommend/menu-save", response_model=PersonalizedMenuResponse)
+@app.post("/api/recommand/menu-save", response_model=PersonalizedMenuResponse)
 def generate_menu_save(
     payload: PersonalizedMenuRequest,
     current_user: User = Depends(get_current_user_from_token),
     db: Session = Depends(get_db),
 ):
-    label = (payload.label or "").strip().lower()
-    if label not in {"home", "work"}:
-        raise HTTPException(status_code=400, detail="label은 home/work 중 하나여야 합니다.")
+    _migrate_work_to_company(db, user_number=current_user.user_number)
+    label = _validate_location_label(payload.label)
 
-    requested_radius = max(100, min(int(payload.radius_m or 500), 3000))
+    requested_radius = max(100, min(int(payload.radius_m or 1000), 3000))
     goal_type = _resolve_goal_type_for_user(db, current_user.user_number)
     tdee_kcal = _resolve_tdee_kcal_for_user(db, current_user)
     daily_target_kcal = _goal_daily_target_kcal(tdee_kcal, goal_type)
     meal_targets = _meal_targets_from_daily(daily_target_kcal)
 
-    has_request_location = bool((payload.address_text or "").strip()) or (
-        payload.lat is not None and payload.lng is not None
+    resolved_address_text = (payload.address_text or "").strip() or None
+    resolved_lat = payload.lat
+    resolved_lng = payload.lng
+    if not resolved_address_text and (resolved_lat is None or resolved_lng is None):
+        existing_location = _get_location_profile(db, current_user.user_number, label)
+        if existing_location and (existing_location.address_text or "").strip():
+            resolved_address_text = (existing_location.address_text or "").strip()
+    has_request_location = bool(resolved_address_text) or (
+        resolved_lat is not None and resolved_lng is not None
     )
 
     # 1) 요청에 위치가 있으면: 수집/저장 먼저 수행
@@ -2186,11 +2695,11 @@ def generate_menu_save(
             user=current_user,
             payload=CollectorRunRequest(
                 label=label,
-                address_text=(payload.address_text or "").strip() or None,
-                lat=payload.lat,
-                lng=payload.lng,
+                address_text=resolved_address_text,
+                lat=resolved_lat,
+                lng=resolved_lng,
                 radius_m=requested_radius,
-                max_restaurants=50,
+                max_restaurants=100,
             ),
         )
 
@@ -2220,7 +2729,7 @@ def generate_menu_save(
             payload=CollectorRunRequest(
                 label=label,
                 radius_m=used_radius,
-                max_restaurants=50,
+                max_restaurants=100,
             ),
         )
         candidates = _query_verified_menu_candidates(
@@ -2235,8 +2744,14 @@ def generate_menu_save(
     used_menu_ids: set[int] = set()
     for meal in ("breakfast", "lunch", "dinner"):
         target = meal_targets[meal]
+        filtered = [
+            item
+            for item in candidates
+            if _is_likely_open_for_meal(item, meal)
+            and _is_goal_compatible(item, goal_type, target)
+        ]
         scored = sorted(
-            candidates,
+            filtered,
             key=lambda item: _menu_score(item, target, goal_type),
             reverse=True,
         )
@@ -2251,6 +2766,22 @@ def generate_menu_save(
                 break
         ranked[meal] = picked
 
+    def _to_personalized_menu_item(row: dict) -> PersonalizedMenuItem:
+        return PersonalizedMenuItem(
+            restaurant_id=int(row["restaurant_id"]),
+            restaurant_name=str(row["restaurant_name"]),
+            place_url=str(row.get("place_url") or ""),
+            menu_id=int(row["menu_id"]),
+            menu_name=str(row["menu_name"]),
+            price=float(row["price"]),
+            distance_m=float(row["distance_m"]),
+            calories_kcal=float(row["calories_kcal"]),
+            carbs_g=float(row["carbs_g"]),
+            protein_g=float(row["protein_g"]),
+            fat_g=float(row["fat_g"]),
+            confidence=float(row["confidence"]),
+        )
+
     return PersonalizedMenuResponse(
         goal_type=goal_type,
         tdee_kcal=tdee_kcal,
@@ -2259,9 +2790,9 @@ def generate_menu_save(
         total_candidates=total_candidates,
         used_radius_m=used_radius,
         collector_triggered=collector_triggered,
-        breakfast=[PersonalizedMenuItem(**row) for row in ranked["breakfast"]],
-        lunch=[PersonalizedMenuItem(**row) for row in ranked["lunch"]],
-        dinner=[PersonalizedMenuItem(**row) for row in ranked["dinner"]],
+        breakfast=[_to_personalized_menu_item(row) for row in ranked["breakfast"]],
+        lunch=[_to_personalized_menu_item(row) for row in ranked["lunch"]],
+        dinner=[_to_personalized_menu_item(row) for row in ranked["dinner"]],
     )
 
 
@@ -2273,416 +2804,6 @@ def run_collector_pipeline(
 ):
     return CollectorRunResponse(**_run_collector_pipeline(db=db, user=current_user, payload=payload))
 
-
-@app.post("/api/diet-plan", response_model=DietPlanWithIntakeResponse)
-def generate_1day_diet_plan(
-    payload: DietPlan3DaysRequest,
-    current_user: User = Depends(get_current_user_from_token),
-    db: Session = Depends(get_db),
-):
-    """인바디 기반 1일 식단 추천 (OpenAI)"""
-    user = current_user
-
-    profile = (
-        db.query(UserProfile)
-        .filter(UserProfile.user_number == user.user_number)
-        .first()
-    )
-    latest_inbody = (
-        db.query(InBodyRecord)
-        .filter(InBodyRecord.user_number == user.user_number)
-        .order_by(InBodyRecord.created_at.desc())
-        .first()
-    )
-    if not latest_inbody:
-        raise HTTPException(status_code=404, detail="인바디 기록이 없습니다.")
-
-    body_stage1 = None
-    body_stage2 = None
-    gender_raw = (profile.gender if profile else None)
-    gender = None
-    if gender_raw:
-        value = str(gender_raw).strip().lower()
-        if value in ("m", "male", "남", "남성"):
-            gender = "M"
-        elif value in ("f", "female", "여", "여성"):
-            gender = "F"
-
-    required_fields = {
-        "height": latest_inbody.height,
-        "weight": latest_inbody.weight,
-        "body_fat_mass": latest_inbody.body_fat_mass,
-        "body_fat_pct": latest_inbody.body_fat_pct,
-        "skeletal_muscle_mass": latest_inbody.skeletal_muscle_mass,
-    }
-    if gender and all(value is not None for value in required_fields.values()):
-        inbody_input = InbodyInput(
-            gender=gender,
-            height_cm=latest_inbody.height,
-            weight_kg=latest_inbody.weight,
-            body_fat_kg=latest_inbody.body_fat_mass,
-            body_fat_pct=latest_inbody.body_fat_pct,
-            skeletal_muscle_kg=latest_inbody.skeletal_muscle_mass,
-            bmr_kcal=latest_inbody.bmr,
-        )
-        body_result = classify_body_type(inbody_input)
-        body_stage1 = body_result.stage1
-        body_stage2 = body_result.stage2
-
-    goal_type = _normalize_goal_type(payload.goal_type)
-    if goal_type and goal_type not in {"diet", "maintain", "bulk"}:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="goal_type은 diet/maintain/bulk 중 하나여야 합니다.",
-        )
-
-    latest_goal = (
-        db.query(UserGoal)
-        .filter(UserGoal.user_number == user.user_number)
-        .order_by(UserGoal.created_at.desc())
-        .first()
-    )
-    if goal_type is None:
-        if body_stage1 or body_stage2:
-            goal_type = infer_goal_type(body_stage1 or "", body_stage2 or "")
-        elif latest_goal and latest_goal.goal_type:
-            goal_type = _normalize_goal_type(latest_goal.goal_type)
-        elif profile and profile.goal_type:
-            goal_type = _normalize_goal_type(profile.goal_type)
-        else:
-            goal_type = "maintain"
-
-    target_calorie = payload.target_calorie
-    if target_calorie is None:
-        if latest_goal and latest_goal.target_calorie is not None:
-            target_calorie = latest_goal.target_calorie
-        else:
-            target_calorie = estimate_target_calorie(
-                goal_type,
-                latest_inbody.bmr,
-                latest_inbody.weight,
-                normalize_activity_level(profile.activity_level) if profile else None,
-            )
-
-    preferred_meals = []
-
-    prompt = {
-        "goal_type": goal_type,
-        "target_calorie": round(float(target_calorie)) if target_calorie else None,
-        "body_type_stage1": body_stage1,
-        "body_type_stage2": body_stage2,
-        "latest_inbody": {
-            "height_cm": latest_inbody.height,
-            "weight_kg": latest_inbody.weight,
-            "body_fat_pct": latest_inbody.body_fat_pct,
-            "skeletal_muscle_kg": latest_inbody.skeletal_muscle_mass,
-            "bmr_kcal": latest_inbody.bmr,
-        },
-        "activity_level": normalize_activity_level(profile.activity_level) if profile else None,
-        "notes": [
-            "한국어로만 작성한다.",
-            "1일치(1일) 식단을 제공한다.",
-            "각 일자는 아침/점심/저녁으로 구성한다.",
-            "일일 총칼로리는 목표 칼로리 ±5% 범위를 지향한다.",
-            "식단 이름은 한국어로 자연스럽고 구체적으로 작성한다.",
-            "영양값은 추정치이며 현실적인 범위로 작성한다.",
-            "요즘 한국에서 많이 먹는 대중적이고 익숙한 메뉴 위주로 구성한다.",
-            "지나치게 방대한 메뉴 구성을 피하고 현실적으로 준비 가능한 수준으로 제안한다.",
-        ],
-    }
-
-    try:
-        plan = generate_one_day_plan(prompt, preferred_meals=preferred_meals)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"식단 생성 결과가 올바르지 않습니다. error={type(exc).__name__}: {exc}",
-        )
-
-    # 음식 이미지 URL 붙이기 (Pexels)
-    for day in plan.days:
-        for meal in (day.breakfast, day.lunch, day.dinner):
-            if not meal.image_url:
-                meal.image_url = _fetch_pexels_image(meal.name)
-
-    record = UserDietPlan(
-        user_number=user.user_number,
-        goal_type=goal_type,
-        target_calorie=target_calorie,
-        plan_json=json.dumps(plan.model_dump(), ensure_ascii=False),
-    )
-    db.add(record)
-    db.commit()
-
-    day0 = plan.days[0]
-    today_intake = TodayIntakeResponse(
-        goal_type=plan.goal_type,
-        target_calorie=plan.target_calorie,
-        total_calories_kcal=int(day0.total_calories_kcal),
-        total_carbs_g=float(day0.total_carbs_g),
-        total_protein_g=float(day0.total_protein_g),
-        total_fat_g=float(day0.total_fat_g),
-        plan_date=day0.date,
-    )
-
-    return {
-        "plan": plan,
-        "today_intake": today_intake,
-    }
-
-
-@app.post("/api/diet-plan/context", response_model=DietPlanWithIntakeResponse)
-def generate_context_aware_diet_plan(
-    payload: DietPlanContextRequest,
-    current_user: User = Depends(get_current_user_from_token),
-    db: Session = Depends(get_db),
-):
-    """상황 기반 1일 식단 추천 (OpenAI + Vector)"""
-    user = current_user
-    context = payload.context
-
-    if not context or not context.strip():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="context는 비어 있을 수 없습니다.",
-        )
-
-    profile = (
-        db.query(UserProfile)
-        .filter(UserProfile.user_number == user.user_number)
-        .first()
-    )
-    latest_inbody = (
-        db.query(InBodyRecord)
-        .filter(InBodyRecord.user_number == user.user_number)
-        .order_by(InBodyRecord.created_at.desc())
-        .first()
-    )
-    if not latest_inbody:
-        raise HTTPException(status_code=404, detail="인바디 기록이 없습니다.")
-
-    body_stage1 = None
-    body_stage2 = None
-    gender_raw = (profile.gender if profile else None)
-    gender = None
-    if gender_raw:
-        value = str(gender_raw).strip().lower()
-        if value in ("m", "male", "남", "남성"):
-            gender = "M"
-        elif value in ("f", "female", "여", "여성"):
-            gender = "F"
-
-    required_fields = {
-        "height": latest_inbody.height,
-        "weight": latest_inbody.weight,
-        "body_fat_mass": latest_inbody.body_fat_mass,
-        "body_fat_pct": latest_inbody.body_fat_pct,
-        "skeletal_muscle_mass": latest_inbody.skeletal_muscle_mass,
-    }
-    if gender and all(value is not None for value in required_fields.values()):
-        inbody_input = InbodyInput(
-            gender=gender,
-            height_cm=latest_inbody.height,
-            weight_kg=latest_inbody.weight,
-            body_fat_kg=latest_inbody.body_fat_mass,
-            body_fat_pct=latest_inbody.body_fat_pct,
-            skeletal_muscle_kg=latest_inbody.skeletal_muscle_mass,
-            bmr_kcal=latest_inbody.bmr,
-        )
-        body_result = classify_body_type(inbody_input)
-        body_stage1 = body_result.stage1
-        body_stage2 = body_result.stage2
-
-    latest_goal = (
-        db.query(UserGoal)
-        .filter(UserGoal.user_number == user.user_number)
-        .order_by(UserGoal.created_at.desc())
-        .first()
-    )
-
-    goal_type = infer_goal_type(body_stage1 or "", body_stage2 or "")
-    if latest_goal and latest_goal.goal_type:
-        goal_type = _normalize_goal_type(latest_goal.goal_type)
-    elif profile and profile.goal_type:
-        goal_type = _normalize_goal_type(profile.goal_type)
-    else:
-        goal_type = "maintain"
-
-    target_calorie = payload.target_calorie
-    if target_calorie is None:
-        if latest_goal and latest_goal.target_calorie is not None:
-            target_calorie = latest_goal.target_calorie
-        else:
-            target_calorie = estimate_target_calorie(
-                goal_type,
-                latest_inbody.bmr,
-                latest_inbody.weight,
-                normalize_activity_level(profile.activity_level) if profile else None,
-            )
-
-    preferred_meals = []
-
-    prompt = {
-        "goal_type": goal_type,
-        "target_calorie": round(float(target_calorie)) if target_calorie else None,
-        "body_type_stage1": body_stage1,
-        "body_type_stage2": body_stage2,
-        "user_context": context.strip(),
-        "latest_inbody": {
-            "height_cm": latest_inbody.height,
-            "weight_kg": latest_inbody.weight,
-            "body_fat_pct": latest_inbody.body_fat_pct,
-            "skeletal_muscle_kg": latest_inbody.skeletal_muscle_mass,
-            "bmr_kcal": latest_inbody.bmr,
-        },
-        "activity_level": normalize_activity_level(profile.activity_level) if profile else None,
-        "notes": [
-            "한국어로만 작성한다.",
-            "1일치(1일) 식단을 제공한다.",
-            "사용자의 특별 요청(user_context)을 최우선으로 고려하여 식단을 구성한다.",
-            "각 일자는 아침/점심/저녁으로 구성한다.",
-            "일일 총칼로리는 목표 칼로리 ±10% 범위를 지향한다.",
-            "식단 이름은 한국어로 자연스럽고 구체적으로 작성한다.",
-            "영양값은 추정치이며 현실적인 범위로 작성한다.",
-            "요즘 한국에서 많이 먹는 대중적이고 익숙한 메뉴 위주로 구성한다.",
-            "지나치게 방대한 메뉴 구성을 피하고 현실적으로 준비 가능한 수준으로 제안한다.",
-        ],
-    }
-
-    try:
-        plan = generate_one_day_plan(prompt, preferred_meals=preferred_meals)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"식단 생성 결과가 올바르지 않습니다. error={type(exc).__name__}: {exc}",
-        )
-
-    # 음식 이미지 URL 붙이기 (Pexels)
-    for day in plan.days:
-        for meal in (day.breakfast, day.lunch, day.dinner):
-            if not meal.image_url:
-                meal.image_url = _fetch_pexels_image(meal.name)
-
-    record = UserDietPlan(
-        user_number=user.user_number,
-        goal_type=goal_type,
-        target_calorie=target_calorie,
-        plan_json=json.dumps(plan.model_dump(), ensure_ascii=False),
-    )
-    db.add(record)
-    db.commit()
-
-    day0 = plan.days[0]
-    today_intake = TodayIntakeResponse(
-        goal_type=plan.goal_type,
-        target_calorie=plan.target_calorie,
-        total_calories_kcal=int(day0.total_calories_kcal),
-        total_carbs_g=float(day0.total_carbs_g),
-        total_protein_g=float(day0.total_protein_g),
-        total_fat_g=float(day0.total_fat_g),
-        plan_date=day0.date,
-    )
-
-    return {
-        "plan": plan,
-        "today_intake": today_intake,
-    }
-
-
-@app.post("/api/diet-plan/places", response_model=DietPlanPlacesResponse)
-def get_diet_plan_places(
-    payload: DietPlanPlacesRequest,
-    current_user: User = Depends(get_current_user_from_token),
-):
-    """내 위치 기반 주변 편의점/음식점 10곳 반환"""
-    lat = float(payload.lat)  # 위도 (latitude)
-    lng = float(payload.lng)  # 경도 (longitude)
-    base_radius_m = payload.radius_m or 2000
-    food_name = (payload.food_name or "").strip()
-
-    categories = ["CS2", "FD6"]  # 편의점, 음식점
-    queries: List[str] = []
-    tokens: List[str] = []
-    if food_name:
-        queries = _build_place_queries(food_name)
-        tokens = _extract_food_tokens(food_name)
-
-    def _search_with_radius(radius_m: int) -> List[dict]:
-        results: List[dict] = []
-        if queries:
-            for q in queries:
-                results.extend(_kakao_local_search_keyword(lat, lng, radius_m, q))
-        # 결과가 부족하면 카테고리 검색으로 보강
-        if len(results) < 8:
-            for code in categories:
-                results.extend(_kakao_local_search_category(lat, lng, radius_m, code))
-        return results
-
-    def _add_dedup(items: List[dict], dedup: dict[str, dict]) -> None:
-        for item in items:
-            place_id = str(item.get("id"))
-            if not place_id or place_id in dedup:
-                continue
-            dedup[place_id] = item
-
-    radius_steps = [base_radius_m]
-    if base_radius_m < 10000:
-        radius_steps.append(10000)
-    if base_radius_m < 15000:
-        radius_steps.append(15000)
-    if base_radius_m < 20000:
-        radius_steps.append(20000)
-
-    dedup: dict[str, dict] = {}
-    for radius_m in radius_steps:
-        _add_dedup(_search_with_radius(radius_m), dedup)
-        if len(dedup) >= 10:
-            break
-
-    def _distance_value(value: Optional[str]) -> int:
-        try:
-            return int(value or 10**9)
-        except Exception:
-            return 10**9
-
-    if tokens:
-        sorted_items = sorted(
-            dedup.values(),
-            key=lambda x: (-_place_score(x, tokens, queries), _distance_value(x.get("distance"))),
-        )
-    else:
-        sorted_items = sorted(dedup.values(), key=lambda x: _distance_value(x.get("distance")))
-    limited = sorted_items[:10]
-
-    places: List[DietPlanPlaceItem] = []
-    for item in limited:
-        try:
-            x = float(item.get("x"))
-            y = float(item.get("y"))
-        except Exception:
-            continue
-        places.append(
-            DietPlanPlaceItem(
-                id=str(item.get("id")),
-                name=item.get("place_name") or "",
-                category_group_code=item.get("category_group_code"),
-                category_group_name=item.get("category_group_name"),
-                category_name=item.get("category_name"),
-                address_name=item.get("address_name"),
-                road_address_name=item.get("road_address_name"),
-                phone=item.get("phone"),
-                place_url=item.get("place_url"),
-                distance_m=_distance_value(item.get("distance")),
-                x=x,
-                y=y,
-            )
-        )
-
-    return DietPlanPlacesResponse(places=places)
 
 
 @app.post("/api/plan/record", response_model=PlanRecordCreateResult)
@@ -2981,6 +3102,8 @@ def get_mypage_records(
         .limit(limit)
         .all()
     )
+    locations = db.query(LocationProfile).filter(LocationProfile.user_number == user_number).all()
+    from app.schemas import LocationProfileResponse
     return {
         "user": (
             {
@@ -3030,6 +3153,7 @@ def get_mypage_records(
             }
             for record in records
         ],
+        "locations": [LocationProfileResponse.model_validate(loc) for loc in locations] if locations else [],
     }
 
 
@@ -3602,6 +3726,107 @@ def classify_by_user(
     record.classify_name = result.stage2
     db.commit()
     return result
+
+
+
+# 위치 정보 업데이트 API (FastAPI 인스턴스 생성 이후, 파일 마지막에 정의)
+from app.schemas import (
+    UserAddressEditRequest,
+    UserAddressResponse,
+)
+
+@app.post("/api/user/address", response_model=UserAddressResponse)
+def edit_mypage_address(
+    payload: UserAddressEditRequest,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    """사용자 주소 등록/수정 (home/company)"""
+    _migrate_work_to_company(db, user_number=current_user.user_number)
+    if payload.user_number is not None and payload.user_number != current_user.user_number:
+        raise HTTPException(status_code=403, detail="user_number가 일치하지 않습니다.")
+
+    home_address = (payload.home_address or "").strip()
+    company_address = (payload.company_address or "").strip()
+    if not home_address and not company_address:
+        raise HTTPException(status_code=400, detail="home_address 또는 company_address가 필요합니다.")
+
+    def upsert_label(label: str, address_text: str) -> None:
+        if not address_text:
+            return
+        norm_label = _validate_location_label(label)
+        profile = (
+            db.query(LocationProfile)
+            .filter(
+                LocationProfile.user_number == current_user.user_number,
+                LocationProfile.label == norm_label,
+            )
+            .one_or_none()
+        )
+        if profile is None and norm_label == "company":
+            profile = (
+                db.query(LocationProfile)
+                .filter(
+                    LocationProfile.user_number == current_user.user_number,
+                    LocationProfile.label == "work",
+                )
+                .one_or_none()
+            )
+            if profile is not None:
+                profile.label = "company"
+        if profile is None:
+            profile = LocationProfile(
+                user_number=current_user.user_number,
+                label=norm_label,
+                address_text=address_text,
+                lat=None,
+                lng=None,
+            )
+            db.add(profile)
+        else:
+            profile.address_text = address_text
+
+    upsert_label("home", home_address)
+    upsert_label("company", company_address)
+    db.commit()
+
+    locations = (
+        db.query(LocationProfile)
+        .filter(LocationProfile.user_number == current_user.user_number)
+        .all()
+    )
+    home = next((loc.address_text for loc in locations if loc.label == "home"), None)
+    work = next((loc.address_text for loc in locations if loc.label == "company"), None)
+    if work is None:
+        work = next((loc.address_text for loc in locations if loc.label == "work"), None)
+    return UserAddressResponse(
+        user_number=current_user.user_number,
+        home_address=home,
+        company_address=work,
+    )
+
+
+@app.get("/api/user/address", response_model=UserAddressResponse)
+def get_user_addresses(
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    """사용자 주소 조회"""
+    _migrate_work_to_company(db, user_number=current_user.user_number)
+    locations = (
+        db.query(LocationProfile)
+        .filter(LocationProfile.user_number == current_user.user_number)
+        .all()
+    )
+    home = next((loc.address_text for loc in locations if loc.label == "home"), None)
+    work = next((loc.address_text for loc in locations if loc.label == "company"), None)
+    if work is None:
+        work = next((loc.address_text for loc in locations if loc.label == "work"), None)
+    return UserAddressResponse(
+        user_number=current_user.user_number,
+        home_address=home,
+        company_address=work,
+    )
 
 if __name__ == "__main__":
     import uvicorn

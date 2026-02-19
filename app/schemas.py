@@ -1,6 +1,6 @@
-"""Pydantic request/response schemas used by FastAPI endpoints."""
-
 from __future__ import annotations
+
+"""Pydantic request/response schemas used by FastAPI endpoints."""
 
 from datetime import date, datetime
 from typing import Any, List, Optional
@@ -20,6 +20,13 @@ class DietRecordResponse(BaseModel):
     food_name: str
     calories: int
     message: str
+
+
+class LocationProfileUpdateRequest(BaseModel):
+    label: str  # home/company
+    address_text: str
+    lat: float
+    lng: float
 
 
 class UserResponse(BaseModel):
@@ -79,13 +86,37 @@ class MyPageResponse(BaseModel):
         from_attributes = True
 
 
-class MyPageEnvelopeResponse(BaseModel):
-    """마이페이지 응답 모델 (목표 + 식단 기록)"""
 
+class LocationProfileResponse(BaseModel):
+    location_id: int
+    label: str
+    address_text: str
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+
+    class Config:
+        from_attributes = True
+
+
+class MyPageEnvelopeResponse(BaseModel):
+    """마이페이지 응답 모델 (목표 + 식단 기록 + 위치)"""
     user: Optional[UserResponse] = None
     goal: Optional[UserGoalResponse] = None
     body: Optional[dict[str, Any]] = None
     records: List[MyPageResponse]
+    locations: Optional[List[LocationProfileResponse]] = None
+
+
+class UserAddressEditRequest(BaseModel):
+    user_number: Optional[int] = None
+    home_address: Optional[str] = None
+    company_address: Optional[str] = None
+
+
+class UserAddressResponse(BaseModel):
+    user_number: int
+    home_address: Optional[str] = None
+    company_address: Optional[str] = None
 
 
 class UserGoalUpdateRequest(BaseModel):
@@ -142,15 +173,46 @@ class TodayIntakeResponse(BaseModel):
     plan_date: Optional[str] = None
 
 
+class MealPlanItemSchema(BaseModel):
+    name: str
+    description: Optional[str] = None
+    calories_kcal: int
+    carbs_g: float
+    protein_g: float
+    fat_g: float
+    image_url: Optional[str] = None
+
+
+class DayMealPlanSchema(BaseModel):
+    day_label: str
+    date: Optional[str] = None
+    breakfast: MealPlanItemSchema
+    lunch: MealPlanItemSchema
+    dinner: MealPlanItemSchema
+    total_calories_kcal: int
+    total_carbs_g: float
+    total_protein_g: float
+    total_fat_g: float
+
+
+class OneDayMealPlanSchema(BaseModel):
+    goal_type: str
+    target_calorie: Optional[int] = None
+    body_type_stage1: Optional[str] = None
+    body_type_stage2: Optional[str] = None
+    notes: List[str]
+    days: List[DayMealPlanSchema]
+
+
 class UserGoalWithPlanResponse(UserGoalResponse):
     """사용자 목표 변경 응답 (목표 + 최신 식단)"""
 
-    plan: Optional[dict[str, Any]] = None
+    plan: OneDayMealPlanSchema | None = None
     today_intake: Optional[TodayIntakeResponse] = None
 
 
 class DietPlanWithIntakeResponse(BaseModel):
-    plan: dict[str, Any]
+    plan: OneDayMealPlanSchema
     today_intake: TodayIntakeResponse
 
 
@@ -286,3 +348,61 @@ class SocialRegisterRequest(BaseModel):
     age: Optional[int] = None
     activity_level: Optional[str] = None
     goal_type: Optional[str] = "maintain"
+
+
+class PersonalizedMenuRequest(BaseModel):
+    label: str = "home"  # home/company
+    address_text: Optional[str] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    radius_m: int = 1000
+
+
+class PersonalizedMenuItem(BaseModel):
+    restaurant_id: int
+    restaurant_name: str
+    place_url: str
+    menu_id: int
+    menu_name: str
+    price: float
+    distance_m: float
+    calories_kcal: float
+    carbs_g: float
+    protein_g: float
+    fat_g: float
+    confidence: float
+
+
+class PersonalizedMenuResponse(BaseModel):
+    goal_type: str
+    tdee_kcal: int
+    daily_target_kcal: int
+    meal_target_kcal: dict[str, int]
+    total_candidates: int
+    used_radius_m: int
+    collector_triggered: bool
+    breakfast: List[PersonalizedMenuItem]
+    lunch: List[PersonalizedMenuItem]
+    dinner: List[PersonalizedMenuItem]
+
+
+class CollectorRunRequest(BaseModel):
+    label: str = "home"  # home/company
+    address_text: Optional[str] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    radius_m: int = 1000
+    max_restaurants: int = 100
+
+
+class CollectorRunResponse(BaseModel):
+    label: str
+    location_profile_id: int
+    lat: float
+    lng: float
+    requested_radius_m: int
+    used_radius_m: int
+    restaurants_collected: int
+    menus_saved: int
+    nutritions_saved: int
+    skipped_items: int
