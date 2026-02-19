@@ -383,7 +383,30 @@ def extract_key_values(text: str) -> dict:
                             if lo is None or (lo <= val <= hi):
                                 return val
         
+        if key == "bmr":
+            # 1순위: "기초대사량 1259 kcal" 또는 "기초대사량 1259 keal" (오타 포함)
+            for line in window_lines:
+                # "기초대사량" 키워드 뒤의 숫자 추출
+                m = re.search(r"(기초대사량|기초대사랑|기초대사항)\s+([0-9]+(?:\.\s*[0-9]+)?)", line)
+                if m:
+                    val = parse_number(m.group(2))
+                    if val is not None:
+                        lo, hi = ranges.get(key, (None, None))
+                        if lo is None or (lo <= val <= hi):
+                            return val
+            
+            # 2순위: "BMR" 영문 키워드 뒤의 숫자
+            for line in window_lines:
+                m = re.search(r"BMR\s+([0-9]+(?:\.\s*[0-9]+)?)", line, re.IGNORECASE)
+                if m:
+                    val = parse_number(m.group(1))
+                    if val is not None:
+                        lo, hi = ranges.get(key, (None, None))
+                        if lo is None or (lo <= val <= hi):
+                            return val
+        
         # 기존 fallback 로직 (위에서 못 찾은 경우)
+
         for line in window_lines:
             # (체중/지방)조절, Control 등은 측정치가 아닌 참고용 수치(범위 등)일 가능성이 높음
             if re.search(r"(Flue|Fluid|Control|조절|적정체중|표준체중)", line, re.IGNORECASE):

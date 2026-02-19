@@ -942,17 +942,29 @@ def generate_1day_diet_plan(
         else:
             goal_type = "maintain"
 
+
     target_calorie = payload.target_calorie
     if target_calorie is None:
-        if latest_goal and latest_goal.target_calorie is not None:
+        # 활동 수준이 설정되어 있으면 항상 재계산 (활동 수준 변경 반영)
+        if profile and profile.activity_level:
+            target_calorie = estimate_target_calorie(
+                goal_type,
+                latest_inbody.bmr,
+                latest_inbody.weight,
+                normalize_activity_level(profile.activity_level),
+            )
+        # 활동 수준이 없으면 저장된 목표 칼로리 사용
+        elif latest_goal and latest_goal.target_calorie is not None:
             target_calorie = latest_goal.target_calorie
+        # 둘 다 없으면 기본 계산
         else:
             target_calorie = estimate_target_calorie(
                 goal_type,
                 latest_inbody.bmr,
                 latest_inbody.weight,
-                normalize_activity_level(profile.activity_level) if profile else None,
+                None,
             )
+
 
     preferred_meals = []
 
@@ -1018,7 +1030,7 @@ def generate_1day_diet_plan(
     )
 
     return {
-        "plan": plan,
+        "plan": plan.model_dump(),
         "today_intake": today_intake,
     }
 
@@ -1178,7 +1190,7 @@ def generate_context_aware_diet_plan(
     )
 
     return {
-        "plan": plan,
+        "plan": plan.model_dump(),
         "today_intake": today_intake,
     }
 
@@ -1380,7 +1392,7 @@ def update_activity_level(
     if level not in ACTIVITY_FACTORS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="activity_level은 sedentary/light/moderate/active 중 하나여야 합니다.",
+            detail="activity_level은 sedentary/light/moderate/active/very_active 중 하나여야 합니다.",
         )
 
     profile = db.query(UserProfile).filter(UserProfile.user_number == current_user.user_number).one_or_none()
@@ -1820,6 +1832,7 @@ async def inbody_ocr(
                 "light": 1.375,
                 "moderate": 1.55,
                 "active": 1.725,
+                "very_active": 1.9,
             },
         }
 
@@ -1847,6 +1860,7 @@ async def inbody_ocr(
             "light": 1.375,
             "moderate": 1.55,
             "active": 1.725,
+            "very_active": 1.9,
         },
     }
 
@@ -1893,6 +1907,7 @@ async def inbody_ocr_upload(
                 "light": 1.375,
                 "moderate": 1.55,
                 "active": 1.725,
+                "very_active": 1.9,
             },
         }
 
@@ -1919,6 +1934,7 @@ async def inbody_ocr_upload(
             "light": 1.375,
             "moderate": 1.55,
             "active": 1.725,
+            "very_active": 1.9,
         },
     }
 
