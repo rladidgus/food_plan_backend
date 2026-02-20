@@ -68,6 +68,7 @@ from app.schemas import (
     PersonalizedMenuRequest,
     PersonalizedMenuResponse,
     RecordDeleteResponse,
+    RecommendMealRecordIn,
     RecommendRecordCreateRequest,
     SocialCheckRequest,
     SocialCheckResponse,
@@ -2688,6 +2689,94 @@ def upsert_user_goal(
     }
 
 
+def _save_recommend_meals_to_records(
+    db: Session,
+    user: User,
+    meals: List[RecommendMealRecordIn],
+    record_date: Optional[str] = None,
+) -> List[int]:
+    if not meals:
+        return []
+
+    record_day = datetime.now().date()
+    if record_date:
+        try:
+            record_day = datetime.strptime(record_date, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="record_date는 YYYY-MM-DD 형식이어야 합니다.")
+
+    allowed_meal_types = {"breakfast", "lunch", "dinner", "snack", "아침", "점심", "저녁", "간식"}
+    meal_type_alias = {
+        "아침": "breakfast",
+        "점심": "lunch",
+        "저녁": "dinner",
+    }
+    meal_time_map = {
+        "breakfast": time(8, 0, 0),
+        "lunch": time(13, 0, 0),
+        "dinner": time(19, 0, 0),
+    }
+
+    record_ids: List[int] = []
+    for meal in meals:
+        if not bool(meal.checked):
+            continue
+
+        raw_type = (meal.meal_type or "").strip().lower()
+        if raw_type not in allowed_meal_types:
+            raise HTTPException(status_code=400, detail="meal_type은 아침/점심/저녁/간식 중 하나여야 합니다.")
+        meal_type = meal_type_alias.get(raw_type, raw_type)
+
+        menu = (
+            db.query(
+                MenuItem.menu_id,
+                MenuItem.name.label("menu_name"),
+                Restaurant.name.label("restaurant_name"),
+                NutritionFacts.calories_kcal,
+                NutritionFacts.carbs_g,
+                NutritionFacts.protein_g,
+                NutritionFacts.fat_g,
+            )
+            .join(Restaurant, Restaurant.restaurant_id == MenuItem.restaurant_id)
+            .join(NutritionFacts, NutritionFacts.menu_item_id == MenuItem.menu_id)
+            .filter(MenuItem.menu_id == int(meal.menu_id))
+            .order_by(NutritionFacts.nutrition_id.desc())
+            .first()
+        )
+        if not menu:
+            raise HTTPException(status_code=404, detail=f"menu_id={meal.menu_id} 메뉴를 찾을 수 없습니다.")
+
+        nutrition_ok = all(
+            value is not None
+            for value in (menu.calories_kcal, menu.carbs_g, menu.protein_g, menu.fat_g)
+        )
+        if not nutrition_ok and any(
+            value is None for value in (meal.calories_kcal, meal.carbs_g, meal.protein_g, meal.fat_g)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=f"menu_id={meal.menu_id} 영양정보가 부족합니다. calories/carbs/protein/fat를 함께 보내주세요.",
+            )
+
+        food_name = (meal.name or "").strip() or f"{menu.restaurant_name} {menu.menu_name}".strip()
+        rec = Record(
+            user_number=user.user_number,
+            food_name=food_name,
+            food_calories=float(menu.calories_kcal if menu.calories_kcal is not None else meal.calories_kcal),
+            food_protein=float(menu.protein_g if menu.protein_g is not None else meal.protein_g),
+            food_carb=float(menu.carbs_g if menu.carbs_g is not None else meal.carbs_g),
+            food_fat=float(menu.fat_g if menu.fat_g is not None else meal.fat_g),
+            meal_type=meal_type,
+            # record 테이블의 기록일시 컬럼(record_created_at)을 명시적으로 사용
+            record_created_at=datetime.combine(record_day, meal_time_map.get(meal_type, time(12, 0, 0))),
+        )
+        db.add(rec)
+        db.flush()
+        record_ids.append(rec.record_id)
+
+    return record_ids
+
+
 @app.post("/api/recommend/menu-save", response_model=PersonalizedMenuResponse)
 def generate_menu_save(
     payload: PersonalizedMenuRequest,
@@ -2818,6 +2907,16 @@ def generate_menu_save(
             confidence=float(row["confidence"]),
         )
 
+    record_ids: Optional[List[int]] = None
+    if payload.meals:
+        record_ids = _save_recommend_meals_to_records(
+            db=db,
+            user=current_user,
+            meals=payload.meals,
+            record_date=payload.record_date,
+        )
+        db.commit()
+
     return PersonalizedMenuResponse(
         goal_type=goal_type,
         tdee_kcal=tdee_kcal,
@@ -2829,6 +2928,7 @@ def generate_menu_save(
         breakfast=[_to_personalized_menu_item(row) for row in ranked["breakfast"]],
         lunch=[_to_personalized_menu_item(row) for row in ranked["lunch"]],
         dinner=[_to_personalized_menu_item(row) for row in ranked["dinner"]],
+        record_ids=record_ids,
     )
 
 
@@ -2911,79 +3011,12 @@ def create_records_from_recommendation(
     if not payload.meals:
         raise HTTPException(status_code=400, detail="meals가 비어 있습니다.")
 
-    record_day = datetime.now().date()
-    if payload.record_date:
-        try:
-            record_day = datetime.strptime(payload.record_date, "%Y-%m-%d").date()
-        except ValueError:
-            raise HTTPException(status_code=400, detail="record_date는 YYYY-MM-DD 형식이어야 합니다.")
-
-    allowed_meal_types = {"breakfast", "lunch", "dinner", "snack", "아침", "점심", "저녁", "간식"}
-    meal_type_alias = {
-        "아침": "breakfast",
-        "점심": "lunch",
-        "저녁": "dinner",
-        "간식": "snack",
-    }
-    meal_time_map = {
-        "breakfast": time(8, 0, 0),
-        "lunch": time(13, 0, 0),
-        "dinner": time(19, 0, 0),
-        "snack": time(16, 0, 0),
-    }
-
-    record_ids: List[int] = []
-    for meal in payload.meals:
-        raw_type = (meal.meal_type or "").strip().lower()
-        if raw_type not in allowed_meal_types:
-            raise HTTPException(status_code=400, detail="meal_type은 아침/점심/저녁/간식 중 하나여야 합니다.")
-        meal_type = meal_type_alias.get(raw_type, raw_type)
-
-        menu = (
-            db.query(
-                MenuItem.menu_id,
-                MenuItem.name.label("menu_name"),
-                Restaurant.name.label("restaurant_name"),
-                NutritionFacts.calories_kcal,
-                NutritionFacts.carbs_g,
-                NutritionFacts.protein_g,
-                NutritionFacts.fat_g,
-            )
-            .join(Restaurant, Restaurant.restaurant_id == MenuItem.restaurant_id)
-            .join(NutritionFacts, NutritionFacts.menu_item_id == MenuItem.menu_id)
-            .filter(MenuItem.menu_id == int(meal.menu_id))
-            .order_by(NutritionFacts.nutrition_id.desc())
-            .first()
-        )
-        if not menu:
-            raise HTTPException(status_code=404, detail=f"menu_id={meal.menu_id} 메뉴를 찾을 수 없습니다.")
-
-        nutrition_ok = all(
-            value is not None
-            for value in (menu.calories_kcal, menu.carbs_g, menu.protein_g, menu.fat_g)
-        )
-        if not nutrition_ok and any(
-            value is None for value in (meal.calories_kcal, meal.carbs_g, meal.protein_g, meal.fat_g)
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail=f"menu_id={meal.menu_id} 영양정보가 부족합니다. calories/carbs/protein/fat를 함께 보내주세요.",
-            )
-
-        food_name = (meal.name or "").strip() or f"{menu.restaurant_name} {menu.menu_name}".strip()
-        rec = Record(
-            user_number=user.user_number,
-            food_name=food_name,
-            food_calories=float(menu.calories_kcal if menu.calories_kcal is not None else meal.calories_kcal),
-            food_protein=float(menu.protein_g if menu.protein_g is not None else meal.protein_g),
-            food_carb=float(menu.carbs_g if menu.carbs_g is not None else meal.carbs_g),
-            food_fat=float(menu.fat_g if menu.fat_g is not None else meal.fat_g),
-            meal_type=meal_type,
-            record_created_at=datetime.combine(record_day, meal_time_map.get(meal_type, time(12, 0, 0))),
-        )
-        db.add(rec)
-        db.flush()
-        record_ids.append(rec.record_id)
+    record_ids = _save_recommend_meals_to_records(
+        db=db,
+        user=user,
+        meals=payload.meals,
+        record_date=payload.record_date,
+    )
 
     db.commit()
     return {"record_ids": record_ids}

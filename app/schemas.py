@@ -171,6 +171,7 @@ class RecommendMealRecordIn(BaseModel):
     carbs_g: Optional[float] = None
     protein_g: Optional[float] = None
     fat_g: Optional[float] = None
+    checked: bool = True
 
 
 class RecommendRecordCreateRequest(BaseModel):
@@ -373,6 +374,8 @@ class PersonalizedMenuRequest(BaseModel):
     lat: Optional[float] = None
     lng: Optional[float] = None
     radius_m: int = 1000
+    record_date: Optional[str] = None
+    meals: Optional[List[RecommendMealRecordIn]] = None
 
 
 class PersonalizedMenuItem(BaseModel):
@@ -401,6 +404,7 @@ class PersonalizedMenuResponse(BaseModel):
     breakfast: List[PersonalizedMenuItem]
     lunch: List[PersonalizedMenuItem]
     dinner: List[PersonalizedMenuItem]
+    record_ids: Optional[List[int]] = None
 
 
 class CollectorRunRequest(BaseModel):
