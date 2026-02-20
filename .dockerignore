@@ -14,7 +14,6 @@ postgres_data/
 
 # 환경 변수
 .env
-.env.local
 .env.prod
 
 # 에디터 설정

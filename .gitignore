@@ -14,6 +14,7 @@ chroma_data/
 # --- 보안 및 설정 (필수) ---
 # 비밀번호나 API 키가 담길 파일
 .env
+.env.prod
 
 # --- 에디터 및 OS (선택) ---
 .vscode/
@@ -21,6 +22,4 @@ chroma_data/
 .DS_Store
 # uploads (runtime-generated)
 uploads/
-# local env files
-.env
-.env.prod
+

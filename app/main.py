@@ -126,7 +126,8 @@ SERPER_API_KEY = os.getenv("SERPER_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OpenAI and OPENAI_API_KEY else None
+TIMEOUT = int(os.getenv("EXTERNAL_API_TIMEOUT", "300"))
+openai_client = OpenAI(api_key=OPENAI_API_KEY, timeout=TIMEOUT) if OpenAI and OPENAI_API_KEY else None
 
 # 환경 변수에서 DB 정보 가져오기
 DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -146,7 +147,7 @@ FRONTEND_ORIGINS = [
     origin.strip()
     for origin in os.getenv(
         "FRONTEND_ORIGINS",
-        "http://localhost:3000"
+        "http://localhost:3000,https://food-plan-frontend-deploy.vercel.app" # 하나의 문자열로 묶음
     ).split(",")
     if origin.strip()
 ]
@@ -575,7 +576,7 @@ def _fetch_pexels_image(query: str) -> Optional[str]:
                 "per_page": 1,
                 "orientation": "landscape",
             },
-            timeout=5,
+            timeout=TIMEOUT,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -610,7 +611,7 @@ def _kakao_local_search_category(lat: float, lng: float, radius_m: int, category
                 "sort": "distance",
                 "size": 10,
             },
-            timeout=5,
+            timeout=TIMEOUT,
         )
         if resp.status_code != 200:
             logger.warning(
@@ -659,7 +660,7 @@ def _kakao_local_search_keyword(lat: float, lng: float, radius_m: int, keyword: 
                 "sort": "distance",
                 "size": 10,
             },
-            timeout=5,
+            timeout=TIMEOUT,
         )
         if resp.status_code != 200:
             logger.warning(
@@ -700,7 +701,7 @@ def _kakao_geocode_address(address_text: str) -> tuple[float, float]:
             KAKAO_LOCAL_ADDRESS_API_URL,
             headers={"Authorization": f"KakaoAK {KAKAO_REST_API_KEY}"},
             params={"query": query, "size": 1},
-            timeout=5,
+            timeout=TIMEOUT,
         )
         if resp.status_code != 200:
             raise HTTPException(status_code=502, detail="Kakao Geocoding API 오류")
@@ -742,7 +743,7 @@ def _kakao_collect_restaurants(lat: float, lng: float, radius_m: int, max_count:
                     "size": 15,
                     "page": page,
                 },
-                timeout=5,
+                timeout=TIMEOUT,
             )
             if resp.status_code != 200:
                 break
@@ -1141,7 +1142,7 @@ def _fetch_kakao_place_menu_candidates(restaurant: Restaurant) -> list[dict]:
         resp = requests.get(
             f"https://place.map.kakao.com/main/v/{place_id}",
             headers=headers,
-            timeout=6,
+            timeout=TIMEOUT,
         )
         if resp.status_code == 200:
             payload = resp.json()
@@ -1152,7 +1153,7 @@ def _fetch_kakao_place_menu_candidates(restaurant: Restaurant) -> list[dict]:
     # JSON에서 못 뽑으면 place 페이지 본문에서 보조 추출
     if not menus:
         try:
-            resp = requests.get(place_url, headers=headers, timeout=6)
+            resp = requests.get(place_url, headers=headers, timeout=TIMEOUT)
             if resp.status_code == 200:
                 text = resp.text or ""
                 menus = _extract_menu_candidates_from_text(text, restaurant.name or "")
@@ -1175,7 +1176,7 @@ def _search_web(query: str, max_results: int = 8) -> list[dict]:
                 "https://google.serper.dev/search",
                 headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
                 json={"q": q, "num": max_results},
-                timeout=8,
+                timeout=TIMEOUT,
             )
             if resp.status_code == 200:
                 data = resp.json()
@@ -1198,7 +1199,7 @@ def _search_web(query: str, max_results: int = 8) -> list[dict]:
                     "search_depth": "basic",
                     "max_results": max_results,
                 },
-                timeout=8,
+                timeout=TIMEOUT,
             )
             if resp.status_code == 200:
                 data = resp.json()
@@ -1216,7 +1217,7 @@ def _search_web(query: str, max_results: int = 8) -> list[dict]:
             resp = requests.get(
                 "https://serpapi.com/search.json",
                 params={"q": q, "api_key": SERPAPI_API_KEY, "num": max_results, "hl": "ko"},
-                timeout=8,
+                timeout=TIMEOUT,
             )
             if resp.status_code == 200:
                 data = resp.json()
@@ -1578,6 +1579,7 @@ def _llm_infer_menu_candidates(restaurant: Restaurant) -> list[dict]:
             model=os.getenv("OPENAI_MENU_MODEL", "gpt-4.1-mini"),
             temperature=0.3,
             response_format={"type": "json_object"},
+            timeout=TIMEOUT,
             messages=[
                 {"role": "system", "content": "너는 메뉴 데이터 수집기다. JSON만 반환한다."},
                 {"role": "user", "content": prompt},
@@ -1717,6 +1719,7 @@ def _llm_infer_nutrition(restaurant: Restaurant, menu_name: str, price: float) -
             model=os.getenv("OPENAI_NUTRITION_MODEL", "gpt-4.1-mini"),
             temperature=0.2,
             response_format={"type": "json_object"},
+            timeout=TIMEOUT,
             messages=[
                 {"role": "system", "content": "너는 메뉴 영양정보 추정 전문가다. JSON만 반환한다."},
                 {"role": "user", "content": prompt},

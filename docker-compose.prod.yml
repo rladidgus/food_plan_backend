@@ -1,6 +1,44 @@
 services:
-  app:
-    env_file:
-      - .env.prod
+  db:
+    image: postgres:15
+    container_name: diet-db-prod
     restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+    # [보안] 호스트 포트(5432) 연결을 제거하여 외부 접근을 차단합니다.
+    # 컨테이너 간(app -> db) 통신은 내부망을 통해 여전히 가능합니다.
+    expose:
+      - "5432"
+    volumes:
+      - ./postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    container_name: diet-app-prod
+    restart: always
+    env_file:
+      - .env.prod  # 배포 전용 환경 변수 파일을 사용합니다.
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_HOST: db
+      DB_NAME: ${DB_NAME:-postgres}
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASS: ${DB_PASS:-password}
+      DB_PORT: 5432
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./uploads:/app/uploads
+      # - ./chroma_data:/app/chroma_data  # 벡터 DB 데이터 유지
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
