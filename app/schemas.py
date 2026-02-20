@@ -164,6 +164,7 @@ class PlanRecordCreateResult(BaseModel):
 
 
 class RecommendMealRecordIn(BaseModel):
+    record_id: Optional[int] = None
     meal_type: str
     menu_id: int
     name: Optional[str] = None
@@ -179,6 +180,12 @@ class RecommendRecordCreateRequest(BaseModel):
     id: Optional[str] = None
     record_date: Optional[str] = None
     meals: List[RecommendMealRecordIn]
+
+
+class RecommendRecordResultItem(BaseModel):
+    menu_id: int
+    record_id: Optional[int] = None
+    deleted: bool = False
 
 
 class TodayIntakeResponse(BaseModel):
@@ -405,6 +412,7 @@ class PersonalizedMenuResponse(BaseModel):
     lunch: List[PersonalizedMenuItem]
     dinner: List[PersonalizedMenuItem]
     record_ids: Optional[List[int]] = None
+    record_results: Optional[List[RecommendRecordResultItem]] = None
 
 
 class CollectorRunRequest(BaseModel):

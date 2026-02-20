@@ -69,6 +69,7 @@ from app.schemas import (
     PersonalizedMenuResponse,
     RecordDeleteResponse,
     RecommendMealRecordIn,
+    RecommendRecordResultItem,
     RecommendRecordCreateRequest,
     SocialCheckRequest,
     SocialCheckResponse,
@@ -2672,6 +2673,7 @@ def upsert_user_goal(
         total_fat_g=float(day0.total_fat_g),
         plan_date=day0.date,
     )
+
     return {
         "goal_id": goal.goal_id,
         "goal_type": goal.goal_type,
@@ -2694,9 +2696,9 @@ def _save_recommend_meals_to_records(
     user: User,
     meals: List[RecommendMealRecordIn],
     record_date: Optional[str] = None,
-) -> List[int]:
+) -> tuple[List[int], List[RecommendRecordResultItem]]:
     if not meals:
-        return []
+        return [], []
 
     record_day = datetime.now().date()
     if record_date:
@@ -2710,18 +2712,19 @@ def _save_recommend_meals_to_records(
         "아침": "breakfast",
         "점심": "lunch",
         "저녁": "dinner",
+        "간식": "snack",
     }
     meal_time_map = {
         "breakfast": time(8, 0, 0),
         "lunch": time(13, 0, 0),
         "dinner": time(19, 0, 0),
+        "snack": time(16, 0, 0),
     }
-
+    day_start = datetime.combine(record_day, time.min)
+    day_end = day_start + timedelta(days=1)
     record_ids: List[int] = []
+    record_results: List[RecommendRecordResultItem] = []
     for meal in meals:
-        if not bool(meal.checked):
-            continue
-
         raw_type = (meal.meal_type or "").strip().lower()
         if raw_type not in allowed_meal_types:
             raise HTTPException(status_code=400, detail="meal_type은 아침/점심/저녁/간식 중 하나여야 합니다.")
@@ -2759,6 +2762,45 @@ def _save_recommend_meals_to_records(
             )
 
         food_name = (meal.name or "").strip() or f"{menu.restaurant_name} {menu.menu_name}".strip()
+
+        if not bool(meal.checked):
+            row = None
+            if meal.record_id is not None:
+                row = (
+                    db.query(Record)
+                    .filter(
+                        Record.record_id == int(meal.record_id),
+                        Record.user_number == user.user_number,
+                    )
+                    .first()
+                )
+            else:
+                # 프론트가 record_id를 아직 보내지 않는 경우를 위한 임시 fallback
+                row = (
+                    db.query(Record)
+                    .filter(
+                        Record.user_number == user.user_number,
+                        Record.meal_type == meal_type,
+                        Record.food_name == food_name,
+                        Record.record_created_at >= day_start,
+                        Record.record_created_at < day_end,
+                    )
+                    .order_by(Record.record_created_at.desc(), Record.record_id.desc())
+                    .first()
+                )
+            deleted_record_id: Optional[int] = None
+            if row:
+                deleted_record_id = int(row.record_id)
+                db.delete(row)
+            record_results.append(
+                RecommendRecordResultItem(
+                    menu_id=int(meal.menu_id),
+                    record_id=deleted_record_id,
+                    deleted=bool(row),
+                )
+            )
+            continue
+
         rec = Record(
             user_number=user.user_number,
             food_name=food_name,
@@ -2773,8 +2815,15 @@ def _save_recommend_meals_to_records(
         db.add(rec)
         db.flush()
         record_ids.append(rec.record_id)
+        record_results.append(
+            RecommendRecordResultItem(
+                menu_id=int(meal.menu_id),
+                record_id=int(rec.record_id),
+                deleted=False,
+            )
+        )
 
-    return record_ids
+    return record_ids, record_results
 
 
 @app.post("/api/recommend/menu-save", response_model=PersonalizedMenuResponse)
@@ -2908,8 +2957,9 @@ def generate_menu_save(
         )
 
     record_ids: Optional[List[int]] = None
+    record_results: Optional[List[RecommendRecordResultItem]] = None
     if payload.meals:
-        record_ids = _save_recommend_meals_to_records(
+        record_ids, record_results = _save_recommend_meals_to_records(
             db=db,
             user=current_user,
             meals=payload.meals,
@@ -2929,6 +2979,7 @@ def generate_menu_save(
         lunch=[_to_personalized_menu_item(row) for row in ranked["lunch"]],
         dinner=[_to_personalized_menu_item(row) for row in ranked["dinner"]],
         record_ids=record_ids,
+        record_results=record_results,
     )
 
 
@@ -3011,7 +3062,7 @@ def create_records_from_recommendation(
     if not payload.meals:
         raise HTTPException(status_code=400, detail="meals가 비어 있습니다.")
 
-    record_ids = _save_recommend_meals_to_records(
+    record_ids, _ = _save_recommend_meals_to_records(
         db=db,
         user=user,
         meals=payload.meals,
@@ -3098,6 +3149,12 @@ def get_latest_inbody(
     )
     if not record:
         return None
+    profile = (
+        db.query(UserProfile)
+        .filter(UserProfile.user_number == current_user.user_number)
+        .one_or_none()
+    )
+    bmr_value = record.bmr if record.bmr is not None else (profile.bmr if profile else None)
     return {
         "inbody_id": record.inbody_id,
         "measurement_date": record.measurement_date.isoformat() if record.measurement_date else None,
@@ -3114,7 +3171,7 @@ def get_latest_inbody(
                 "body_fat_mass": record.body_fat_mass,
                 "body_fat_pct": record.body_fat_pct,
                 "skeletal_muscle_mass": record.skeletal_muscle_mass,
-                "bmr": record.bmr,
+                "bmr": bmr_value,
                 "inbody_score": record.inbody_score,
             }.items() if v is not None
         },
