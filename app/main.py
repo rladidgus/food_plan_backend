@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from app.food_lens import decide_food_gpt_only
+from app.s3 import upload_image_to_s3
 from app.database import get_db, engine, Base, SessionLocal
 from app.inbody import InbodyInput, BodyTypeResult, classify_body_type
 from app.models import Record, InBodyRecord, User, UserProfile, FoodAnalysisResult
@@ -3019,24 +3020,16 @@ def generate_menu_save(
             record_ids=record_ids,
             record_results=record_results,
         )
-        # --- 기존 로직 끝 ---
 
     except Exception as e:
-        # 🚨 여기서 에러의 실체를 터미널(로그)에 출력합니다!
+        import traceback
         error_traceback = traceback.format_exc()
         print("\n" + "="*60)
-        print("🔥 [CRITICAL ERROR] menu-save API에서 서버 크래시 발생!")
+        print("🔥 [CRITICAL ERROR] menu-save API 에러 발생!")
         print(f"에러 메시지: {str(e)}")
         print(f"상세 경로:\n{error_traceback}")
         print("="*60 + "\n")
         
-        if response.status_code != 200:
-            print(f"❌ 카카오 응답 코드: {response.status_code}")
-            print(f"❌ 카카오 에러 메시지: {response.text}") # <--- 이게 핵심!
-            raise HTTPException(status_code=502, detail="Kakao Geocoding API 오류")
-
-        
-        # 서버가 죽지 않도록 500 에러를 던져주고 응답을 유지합니다.
         raise HTTPException(
             status_code=500, 
             detail=f"Internal Server Error: {str(e)}"
@@ -3607,6 +3600,8 @@ async def inbody_ocr(
     content = await image.read()
     if not content:
         raise HTTPException(status_code=400, detail="이미지 파일이 비어 있습니다.")
+    s3_file_name = image.filename or "inbody.jpg"
+    image_url = upload_image_to_s3(content, s3_file_name)
 
     text = upstage_ocr_from_bytes(
         content,
@@ -3625,6 +3620,7 @@ async def inbody_ocr(
             "text": "",
             "values": {},
             "updated": False,
+            "image_url": image_url,
             "activity_level": profile.activity_level if profile else None,
             "activity_level_options": {
                 "sedentary": 1.2,
@@ -3653,6 +3649,7 @@ async def inbody_ocr(
         "text": format_key_values(values),
         "values": values,
         "updated": True,
+        "image_url": image_url,
         "activity_level": profile.activity_level if profile else None,
         "activity_level_options": {
             "sedentary": 1.2,
@@ -3681,6 +3678,8 @@ async def inbody_ocr_upload(
     content = await image.read()
     if not content:
         raise HTTPException(status_code=400, detail="이미지 파일이 비어 있습니다.")
+    s3_file_name = image.filename or "inbody.jpg"
+    image_url = upload_image_to_s3(content, s3_file_name)
 
     text = upstage_ocr_from_bytes(
         content,
@@ -3700,6 +3699,7 @@ async def inbody_ocr_upload(
             "text": "",
             "values": {},
             "updated": False,
+            "image_url": image_url,
             "activity_level": profile.activity_level if profile else None,
             "activity_level_options": {
                 "sedentary": 1.2,
@@ -3727,6 +3727,7 @@ async def inbody_ocr_upload(
         "text": format_key_values(values),
         "values": values,
         "updated": True,
+        "image_url": image_url,
         "activity_level": profile.activity_level if profile else None,
         "activity_level_options": {
             "sedentary": 1.2,
@@ -3881,9 +3882,9 @@ async def vision_food(
         save_path = UPLOAD_DIR / filename
 
         content = await image.read()
+        s3_file_name = image.filename or filename
+        image_url = upload_image_to_s3(content, s3_file_name)
         save_path.write_bytes(content)
-
-        image_url = f"/uploads/foods/{filename}"
 
         result = decide_food_gpt_only(str(save_path))
         decision = result["decision"]

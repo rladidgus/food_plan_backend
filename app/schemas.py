@@ -303,6 +303,7 @@ class InBodyOcrResponse(BaseModel):
     text: str
     values: dict[str, Any]
     updated: bool
+    image_url: Optional[str] = None
     activity_level: Optional[str] = None
     activity_level_options: Optional[dict[str, Any]] = None
 
