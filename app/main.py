@@ -3177,51 +3177,47 @@ def get_today_intake_from_plan(
     current_user: User = Depends(get_current_user_from_token),
     db: Session = Depends(get_db),
 ):
-    """최신 1일 식단 계획에서 총 영양정보 반환"""
+    """오늘 섭취 요약 반환 (마이페이지 표시용)"""
     user = current_user
+    today_start = datetime.combine(datetime.now().date(), time.min)
+    today_end = today_start + timedelta(days=1)
 
-    plan_record = (
-        db.query(UserDietPlan)
-        .filter(UserDietPlan.user_number == user.user_number)
-        .order_by(UserDietPlan.created_at.desc())
-        .first()
+    rows = (
+        db.query(Record)
+        .filter(
+            Record.user_number == user.user_number,
+            Record.record_created_at >= today_start,
+            Record.record_created_at < today_end,
+        )
+        .all()
     )
-    if not plan_record:
-        raise HTTPException(status_code=404, detail="식단 계획이 없습니다.")
 
-    try:
-        plan = json.loads(plan_record.plan_json)
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="식단 계획 데이터가 손상되었습니다.")
-
-    days = plan.get("days") or []
-    if not days:
-        raise HTTPException(status_code=500, detail="식단 계획에 day 데이터가 없습니다.")
-
-    day0 = days[0]
-    goal_type = plan.get("goal_type") or plan_record.goal_type or "maintain"
-    
-    # target_calorie: UserGoal DB가 가장 정확한 출처 (AI 응답값은 신뢰하지 않음)
     latest_goal = (
         db.query(UserGoal)
         .filter(UserGoal.user_number == user.user_number)
         .order_by(UserGoal.created_at.desc())
         .first()
     )
-    target_calorie = (
-        (latest_goal.target_calorie if latest_goal and latest_goal.target_calorie else None)
-        or plan_record.target_calorie
-        or None
+    profile = (
+        db.query(UserProfile)
+        .filter(UserProfile.user_number == user.user_number)
+        .one_or_none()
     )
-    
+    goal_type = (
+        (latest_goal.goal_type if latest_goal and latest_goal.goal_type else None)
+        or (profile.goal_type if profile and profile.goal_type else None)
+        or "maintain"
+    )
+    target_calorie = latest_goal.target_calorie if latest_goal and latest_goal.target_calorie is not None else None
 
     return {
         "goal_type": goal_type,
         "target_calorie": float(target_calorie) if target_calorie else None,
-        "total_calories_kcal": int(day0.get("total_calories_kcal") or 0),
-        "total_carbs_g": float(day0.get("total_carbs_g") or 0),
-        "total_protein_g": float(day0.get("total_protein_g") or 0),
-        "total_fat_g": float(day0.get("total_fat_g") or 0),
+        "total_calories_kcal": int(round(sum(float(r.food_calories or 0) for r in rows))),
+        "total_carbs_g": float(sum(float(r.food_carb or 0) for r in rows)),
+        "total_protein_g": float(sum(float(r.food_protein or 0) for r in rows)),
+        "total_fat_g": float(sum(float(r.food_fat or 0) for r in rows)),
+        "plan_date": today_start.date().isoformat(),
     }
 
 
