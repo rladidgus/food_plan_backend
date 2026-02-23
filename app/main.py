@@ -13,12 +13,12 @@ from uuid import uuid4
 from sqlalchemy import and_, func
 from sqlalchemy.exc import IntegrityError
 from fastapi.responses import RedirectResponse
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, status, Query
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, status, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from app.food_lens import decide_food_gpt_only
-from app.database import get_db, engine, Base
+from app.database import get_db, engine, Base, SessionLocal
 from app.inbody import InbodyInput, BodyTypeResult, classify_body_type
 from app.models import Record, InBodyRecord, User, UserProfile, FoodAnalysisResult
 from typing import List, Optional
@@ -704,6 +704,12 @@ def _kakao_geocode_address(address_text: str) -> tuple[float, float]:
             timeout=TIMEOUT,
         )
         if resp.status_code != 200:
+            print("\n" + "!" * 40)
+            print("❌ 카카오 API 호출 실패!")
+            print(f"❌ 요청 주소: {query}")
+            print(f"❌ 응답 상태 코드: {resp.status_code}")
+            print(f"❌ 카카오 서버의 답변: {resp.text}")
+            print("!" * 40 + "\n")
             raise HTTPException(status_code=502, detail="Kakao Geocoding API 오류")
         data = resp.json()
         docs = data.get("documents") or []
@@ -2153,6 +2159,31 @@ def _run_collector_pipeline(
     }
 
 
+def _run_collector_pipeline_background(user_number: int, payload_data: dict) -> None:
+    """Run collector in background with a fresh DB session (do not reuse request session)."""
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.user_number == user_number).first()
+        if user is None:
+            logger.warning("collector_background_skip user_not_found user_number=%s", user_number)
+            return
+        payload = CollectorRunRequest(**payload_data)
+        result = _run_collector_pipeline(db=db, user=user, payload=payload)
+        logger.info(
+            "collector_background_done user_number=%s label=%s restaurants=%s menus=%s nutritions=%s",
+            user_number,
+            result.get("label"),
+            result.get("restaurants_collected"),
+            result.get("menus_saved"),
+            result.get("nutritions_saved"),
+        )
+    except Exception:
+        db.rollback()
+        logger.exception("collector_background_failed user_number=%s", user_number)
+    finally:
+        db.close()
+
+
 def _extract_food_tokens(food_name: str) -> List[str]:
     tokens = [t for t in re.split(r"\s+", (food_name or "").strip()) if len(t) >= 2]
     return tokens
@@ -2835,6 +2866,7 @@ from fastapi import HTTPException
 @app.post("/api/recommend/menu-save", response_model=PersonalizedMenuResponse)
 def generate_menu_save(
     payload: PersonalizedMenuRequest,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user_from_token),
     db: Session = Depends(get_db),
 ):
@@ -2903,25 +2935,20 @@ def generate_menu_save(
         if len(candidates) < 9:
             collector_triggered = True
             used_radius = 1000 if requested_radius < 1000 else requested_radius
-            
-            # 🚀 가장 의심되는 지점: 이 함수 호출 시 서버가 죽는지 로그로 확인 예정
-            _run_collector_pipeline(
-                db=db,
-                user=current_user,
-                payload=CollectorRunRequest(
-                    label=label,
-                    address_text=resolved_address_text,
-                    lat=resolved_lat,
-                    lng=resolved_lng,
-                    radius_m=used_radius,
-                    max_restaurants=100,
-                ),
-            )
-            candidates = _query_verified_menu_candidates(
-                db=db,
-                user_number=current_user.user_number,
+
+            collector_payload = CollectorRunRequest(
                 label=label,
+                address_text=resolved_address_text,
+                lat=resolved_lat,
+                lng=resolved_lng,
                 radius_m=used_radius,
+                max_restaurants=100,
+            )
+            # 응답을 막지 않도록 수집은 백그라운드에서 별도 DB 세션으로 수행한다.
+            background_tasks.add_task(
+                _run_collector_pipeline_background,
+                int(current_user.user_number),
+                collector_payload.model_dump(),
             )
 
         total_candidates = len(candidates)
@@ -3003,12 +3030,18 @@ def generate_menu_save(
         print(f"상세 경로:\n{error_traceback}")
         print("="*60 + "\n")
         
+        if response.status_code != 200:
+            print(f"❌ 카카오 응답 코드: {response.status_code}")
+            print(f"❌ 카카오 에러 메시지: {response.text}") # <--- 이게 핵심!
+            raise HTTPException(status_code=502, detail="Kakao Geocoding API 오류")
+
+        
         # 서버가 죽지 않도록 500 에러를 던져주고 응답을 유지합니다.
         raise HTTPException(
             status_code=500, 
             detail=f"Internal Server Error: {str(e)}"
         )
-
+        
 
 @app.post("/api/collector/run", response_model=CollectorRunResponse)
 def run_collector_pipeline(
