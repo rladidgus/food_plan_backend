@@ -1,4 +1,5 @@
 import os
+import io
 import json
 import traceback
 import time
@@ -13,7 +14,7 @@ from uuid import uuid4
 from sqlalchemy import and_, func
 from sqlalchemy.exc import IntegrityError
 from fastapi.responses import RedirectResponse
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, status, Query, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, status, Query, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
@@ -26,6 +27,7 @@ from typing import List, Optional
 from app import models
 from app.inbody_ocr import extract_key_values, format_key_values, upstage_ocr_from_bytes, update_user_inbody
 from app.models import (
+    BMIHistory,
     Record,
     InBodyRecord,
     User,
@@ -40,6 +42,7 @@ from app.models import (
     NutritionFacts,
 )
 from app.goal_rules import estimate_target_calorie, normalize_activity_level, ACTIVITY_FACTORS, infer_goal_type
+from PIL import Image, ImageOps
 from app.schemas import (
     ActivityLevelUpdateRequest,
     AuthResponse,
@@ -58,6 +61,7 @@ from app.schemas import (
     DietRecordRequest,
     DietRecordResponse,
     InBodyHistoryResponse,
+    InBodyManualUpdateRequest,
     InBodyOcrResponse,
     LogoutResponse,
     MyPageEnvelopeResponse,
@@ -162,6 +166,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def add_no_cache_headers(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
 def _normalize_activity(item: DailyActivityIn) -> DailyActivityIn:
     data = item.model_dump()
 
@@ -209,6 +223,33 @@ def _validate_location_label(raw: Optional[str]) -> str:
     if label not in {"home", "company"}:
         raise HTTPException(status_code=400, detail="label은 home/company 중 하나여야 합니다.")
     return label
+
+
+def _prepare_inbody_image_for_ocr(
+    content: bytes,
+    filename: str,
+    mime: str,
+) -> tuple[bytes, str, str]:
+    """
+    모바일 카메라 원본 이미지의 회전(EXIF)과 과도한 해상도로 인한 OCR 실패를 줄이기 위한 전처리.
+    """
+    try:
+        with Image.open(io.BytesIO(content)) as img:
+            img = ImageOps.exif_transpose(img).convert("RGB")
+            max_dim = 2200
+            if max(img.size) > max_dim:
+                ratio = max_dim / float(max(img.size))
+                img = img.resize(
+                    (max(1, int(img.width * ratio)), max(1, int(img.height * ratio))),
+                    Image.LANCZOS,
+                )
+            out = io.BytesIO()
+            img.save(out, format="JPEG", quality=90, optimize=True)
+            base = Path(filename or "inbody.jpg").stem or "inbody"
+            return out.getvalue(), f"{base}.jpg", "image/jpeg"
+    except Exception as exc:
+        logger.warning("inbody_image_preprocess_failed filename=%s mime=%s err=%s", filename, mime, exc)
+        return content, filename or "inbody.jpg", mime or "image/jpeg"
 
 
 def _get_location_profile(
@@ -2595,16 +2636,15 @@ def upsert_user_goal(
         .first()
     )
 
-    target_calorie = payload.target_calorie
-    if target_calorie is None:
-        bmr = latest_inbody.bmr if latest_inbody and latest_inbody.bmr is not None else (profile.bmr if profile else None)
-        weight = latest_inbody.weight if latest_inbody and latest_inbody.weight is not None else (profile.weight if profile else None)
-        target_calorie = estimate_target_calorie(
-            goal_type,
-            bmr,
-            weight,
-            normalize_activity_level(profile.activity_level) if profile else None,
-        )
+    # target_calorie는 항상 서버에서 계산 (클라이언트 값 신뢰 안 함)
+    bmr = latest_inbody.bmr if latest_inbody and latest_inbody.bmr is not None else (profile.bmr if profile else None)
+    weight = latest_inbody.weight if latest_inbody and latest_inbody.weight is not None else (profile.weight if profile else None)
+    target_calorie = estimate_target_calorie(
+        goal_type,
+        bmr,
+        weight,
+        normalize_activity_level(profile.activity_level) if profile else None,
+    )
 
     latest_goal = (
         db.query(UserGoal)
@@ -3154,9 +3194,24 @@ def get_today_intake_from_plan(
 
     day0 = days[0]
     goal_type = plan.get("goal_type") or plan_record.goal_type or "maintain"
+    
+    # target_calorie: UserGoal DB가 가장 정확한 출처 (AI 응답값은 신뢰하지 않음)
+    latest_goal = (
+        db.query(UserGoal)
+        .filter(UserGoal.user_number == user.user_number)
+        .order_by(UserGoal.created_at.desc())
+        .first()
+    )
+    target_calorie = (
+        (latest_goal.target_calorie if latest_goal and latest_goal.target_calorie else None)
+        or plan_record.target_calorie
+        or None
+    )
+    
 
     return {
         "goal_type": goal_type,
+        "target_calorie": float(target_calorie) if target_calorie else None,
         "total_calories_kcal": int(day0.get("total_calories_kcal") or 0),
         "total_carbs_g": float(day0.get("total_carbs_g") or 0),
         "total_protein_g": float(day0.get("total_protein_g") or 0),
@@ -3229,6 +3284,117 @@ def get_latest_inbody(
             }.items() if v is not None
         },
         "created_at": record.created_at.isoformat()
+    }
+
+
+@app.put("/api/mypage/inbody", response_model=InBodyHistoryResponse)
+def update_mypage_inbody(
+    payload: InBodyManualUpdateRequest,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    """마이페이지에서 인바디 값을 직접 수정/저장한다."""
+    if payload.user_number is not None and payload.user_number != current_user.user_number:
+        raise HTTPException(status_code=403, detail="user_number가 일치하지 않습니다.")
+
+    editable_fields = (
+        "height",
+        "weight",
+        "bmi",
+        "body_fat_pct",
+        "skeletal_muscle_mass",
+        "body_fat_mass",
+        "bmr",
+    )
+    if not any(getattr(payload, field) is not None for field in editable_fields):
+        raise HTTPException(status_code=400, detail="수정할 인바디 값이 없습니다.")
+
+    # 간단한 유효성 검사 (마이페이지 직접 편집용)
+    numeric_guards = {
+        "height": (payload.height, 50, 300),
+        "weight": (payload.weight, 10, 500),
+        "bmi": (payload.bmi, 1, 100),
+        "body_fat_pct": (payload.body_fat_pct, 0, 100),
+        "skeletal_muscle_mass": (payload.skeletal_muscle_mass, 0, 200),
+        "body_fat_mass": (payload.body_fat_mass, 0, 200),
+        "bmr": (payload.bmr, 100, 10000),
+    }
+    for field_name, (value, lo, hi) in numeric_guards.items():
+        if value is None:
+            continue
+        if not (lo <= float(value) <= hi):
+            raise HTTPException(status_code=400, detail=f"{field_name} 값 범위가 올바르지 않습니다.")
+    profile = db.query(UserProfile).filter(UserProfile.user_number == current_user.user_number).one_or_none()
+    if profile is None:
+        profile = UserProfile(user_number=current_user.user_number)
+        db.add(profile)
+
+    latest = (
+        db.query(InBodyRecord)
+        .filter(InBodyRecord.user_number == current_user.user_number)
+        .order_by(InBodyRecord.created_at.desc())
+        .first()
+    )
+    if latest is None:
+        latest = InBodyRecord(
+            user_number=current_user.user_number,
+            source="manual",
+            measurement_date=datetime.now(timezone.utc),
+        )
+        db.add(latest)
+
+    if payload.height is not None:
+        latest.height = float(payload.height)
+        profile.height = float(payload.height)
+    if payload.weight is not None:
+        latest.weight = float(payload.weight)
+        profile.weight = float(payload.weight)
+    if payload.body_fat_pct is not None:
+        latest.body_fat_pct = float(payload.body_fat_pct)
+        profile.body_fat_percent = float(payload.body_fat_pct)
+    if payload.skeletal_muscle_mass is not None:
+        latest.skeletal_muscle_mass = float(payload.skeletal_muscle_mass)
+        profile.skeletal_muscle_mass = float(payload.skeletal_muscle_mass)
+    if payload.body_fat_mass is not None:
+        latest.body_fat_mass = float(payload.body_fat_mass)
+    if payload.bmr is not None:
+        latest.bmr = float(payload.bmr)
+        profile.bmr = float(payload.bmr)
+    if payload.bmi is not None:
+        db.add(
+            BMIHistory(
+                user_number=current_user.user_number,
+                bmi=float(payload.bmi),
+            )
+        )
+
+    latest.source = "manual"
+
+    db.commit()
+    db.refresh(latest)
+
+    return {
+        "inbody_id": latest.inbody_id,
+        "height": latest.height,
+        "weight": latest.weight,
+        "body_fat_pct": latest.body_fat_pct,
+        "skeletal_muscle_mass": latest.skeletal_muscle_mass,
+        "predicted_classify": latest.predicted_classify,
+        "classify_name": latest.classify_name,
+        "values": {
+            k: v
+            for k, v in {
+                "height": latest.height,
+                "weight": latest.weight,
+                "bmi": float(payload.bmi) if payload.bmi is not None else None,
+                "body_fat_mass": latest.body_fat_mass,
+                "body_fat_pct": latest.body_fat_pct,
+                "skeletal_muscle_mass": latest.skeletal_muscle_mass,
+                "bmr": latest.bmr,
+            }.items()
+            if v is not None
+        },
+        "created_at": latest.created_at.isoformat(),
     }
 
 
@@ -3602,11 +3768,16 @@ async def inbody_ocr(
         raise HTTPException(status_code=400, detail="이미지 파일이 비어 있습니다.")
     s3_file_name = image.filename or "inbody.jpg"
     image_url = upload_image_to_s3(content, s3_file_name)
-
-    text = upstage_ocr_from_bytes(
-        content,
+    ocr_content, ocr_filename, ocr_mime = _prepare_inbody_image_for_ocr(
+        content=content,
         filename=image.filename or "inbody.jpg",
         mime=image.content_type or "image/jpeg",
+    )
+
+    text = upstage_ocr_from_bytes(
+        ocr_content,
+        filename=ocr_filename,
+        mime=ocr_mime,
     )
     values = extract_key_values(text)
     if not values:
@@ -3638,6 +3809,7 @@ async def inbody_ocr(
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB 업데이트 실패: {e}")
+    db.expire_all()  # 다른 세션(update_user_inbody)에서 커밋한 값을 즉시 다시 읽기 위해 캐시 무효화
 
     profile = (
         db.query(UserProfile)
@@ -3680,11 +3852,16 @@ async def inbody_ocr_upload(
         raise HTTPException(status_code=400, detail="이미지 파일이 비어 있습니다.")
     s3_file_name = image.filename or "inbody.jpg"
     image_url = upload_image_to_s3(content, s3_file_name)
-
-    text = upstage_ocr_from_bytes(
-        content,
+    ocr_content, ocr_filename, ocr_mime = _prepare_inbody_image_for_ocr(
+        content=content,
         filename=image.filename or "inbody.jpg",
         mime=image.content_type or "image/jpeg",
+    )
+
+    text = upstage_ocr_from_bytes(
+        ocr_content,
+        filename=ocr_filename,
+        mime=ocr_mime,
     )
     values = extract_key_values(text)
 
@@ -3716,6 +3893,7 @@ async def inbody_ocr_upload(
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB 업데이트 실패: {e}")
+    db.expire_all()  # 다른 세션(update_user_inbody)에서 커밋한 값을 즉시 다시 읽기 위해 캐시 무효화
 
     profile = (
         db.query(UserProfile)

@@ -278,6 +278,17 @@ class ActivityLevelUpdateRequest(BaseModel):
     activity_level: str
 
 
+class InBodyManualUpdateRequest(BaseModel):
+    user_number: Optional[int] = None
+    height: Optional[float] = None
+    weight: Optional[float] = None
+    bmi: Optional[float] = None
+    body_fat_pct: Optional[float] = None
+    skeletal_muscle_mass: Optional[float] = None
+    body_fat_mass: Optional[float] = None
+    bmr: Optional[float] = None
+
+
 class InBodyHistoryResponse(BaseModel):
     """인바디 히스토리 응답"""
 

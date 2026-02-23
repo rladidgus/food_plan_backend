@@ -83,7 +83,10 @@ def generate_one_day_plan(
     preference_text = _build_preference_text(preferred_meals or [])
 
     # 목표 칼로리 범위 및 끼니별 권장 칼로리 계산
-    target = prompt.get("target_calorie", 0) or 2000
+    raw_target = prompt.get("target_calorie")
+    if not raw_target:
+        logger.warning("target_calorie가 프롬프트에 없습니다. prompt=%s", prompt)
+    target = int(raw_target) if raw_target else 2000
     min_cal = int(target * 0.95)
     max_cal = int(target * 1.05)
     
