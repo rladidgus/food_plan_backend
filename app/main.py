@@ -2829,161 +2829,185 @@ def _save_recommend_meals_to_records(
     return record_ids, record_results
 
 
+import traceback  # 코드 상단에 추가되어 있지 않다면 추가해주세요
+from fastapi import HTTPException
+
 @app.post("/api/recommend/menu-save", response_model=PersonalizedMenuResponse)
 def generate_menu_save(
     payload: PersonalizedMenuRequest,
     current_user: User = Depends(get_current_user_from_token),
     db: Session = Depends(get_db),
 ):
-    _migrate_work_to_company(db, user_number=current_user.user_number)
-    label = _validate_location_label(payload.label)
-
-    requested_radius = max(100, min(int(payload.radius_m or 1000), 3000))
-    goal_type = _resolve_goal_type_for_user(db, current_user.user_number)
-    tdee_kcal = _resolve_tdee_kcal_for_user(db, current_user)
-    daily_target_kcal = _goal_daily_target_kcal(tdee_kcal, goal_type)
-    meal_targets = _meal_targets_from_daily(daily_target_kcal)
-
-    input_address_text = (payload.address_text or "").strip() or None
-    input_lat = payload.lat
-    input_lng = payload.lng
-    has_request_location = bool(input_address_text) or (input_lat is not None and input_lng is not None)
-
-    resolved_address_text = input_address_text
-    resolved_lat = input_lat
-    resolved_lng = input_lng
-    if has_request_location:
-        if resolved_lat is None or resolved_lng is None:
-            if not resolved_address_text:
-                raise HTTPException(status_code=400, detail="lat/lng 또는 address_text가 필요합니다.")
-            geo_lat, geo_lng = _kakao_geocode_address(resolved_address_text)
-            resolved_lat, resolved_lng = float(geo_lat), float(geo_lng)
-        if not resolved_address_text:
-            existing_location = _get_location_profile(db, current_user.user_number, label)
-            resolved_address_text = (
-                (existing_location.address_text.strip() if existing_location and existing_location.address_text else "")
-                or f"{resolved_lat:.6f},{resolved_lng:.6f}"
-            )
-        _upsert_location_profile(
-            db=db,
-            user_number=current_user.user_number,
-            label=label,
-            address_text=resolved_address_text,
-            lat=float(resolved_lat),
-            lng=float(resolved_lng),
-        )
-        db.flush()
-
-    # 1) 기본은 DB 캐시 조회, 부족할 때만 collector 실행
-    collector_triggered = False
-
-    # 2) 추천 조회
     try:
-        candidates = _query_verified_menu_candidates(
-            db=db,
-            user_number=current_user.user_number,
-            label=label,
-            radius_m=requested_radius,
-        )
-    except HTTPException as exc:
-        if exc.status_code == 404 and not has_request_location:
-            raise HTTPException(
-                status_code=400,
-                detail="요청 위치(address_text 또는 lat/lng)와 저장된 location_profiles가 모두 없습니다.",
-            )
-        raise
+        # --- 기존 로직 시작 ---
+        _migrate_work_to_company(db, user_number=current_user.user_number)
+        label = _validate_location_label(payload.label)
 
-    used_radius = requested_radius
-    if len(candidates) < 9:
-        collector_triggered = True
-        used_radius = 1000 if requested_radius < 1000 else requested_radius
-        _run_collector_pipeline(
-            db=db,
-            user=current_user,
-            payload=CollectorRunRequest(
+        requested_radius = max(100, min(int(payload.radius_m or 1000), 3000))
+        goal_type = _resolve_goal_type_for_user(db, current_user.user_number)
+        tdee_kcal = _resolve_tdee_kcal_for_user(db, current_user)
+        daily_target_kcal = _goal_daily_target_kcal(tdee_kcal, goal_type)
+        meal_targets = _meal_targets_from_daily(daily_target_kcal)
+
+        input_address_text = (payload.address_text or "").strip() or None
+        input_lat = payload.lat
+        input_lng = payload.lng
+        has_request_location = bool(input_address_text) or (input_lat is not None and input_lng is not None)
+
+        resolved_address_text = input_address_text
+        resolved_lat = input_lat
+        resolved_lng = input_lng
+
+        if has_request_location:
+            if resolved_lat is None or resolved_lng is None:
+                if not resolved_address_text:
+                    raise HTTPException(status_code=400, detail="lat/lng 또는 address_text가 필요합니다.")
+                geo_lat, geo_lng = _kakao_geocode_address(resolved_address_text)
+                resolved_lat, resolved_lng = float(geo_lat), float(geo_lng)
+            
+            if not resolved_address_text:
+                existing_location = _get_location_profile(db, current_user.user_number, label)
+                resolved_address_text = (
+                    (existing_location.address_text.strip() if existing_location and existing_location.address_text else "")
+                    or f"{resolved_lat:.6f},{resolved_lng:.6f}"
+                )
+            
+            _upsert_location_profile(
+                db=db,
+                user_number=current_user.user_number,
                 label=label,
                 address_text=resolved_address_text,
-                lat=resolved_lat,
-                lng=resolved_lng,
+                lat=float(resolved_lat),
+                lng=float(resolved_lng),
+            )
+            db.flush()
+
+        collector_triggered = False
+
+        try:
+            candidates = _query_verified_menu_candidates(
+                db=db,
+                user_number=current_user.user_number,
+                label=label,
+                radius_m=requested_radius,
+            )
+        except HTTPException as exc:
+            if exc.status_code == 404 and not has_request_location:
+                raise HTTPException(
+                    status_code=400,
+                    detail="요청 위치(address_text 또는 lat/lng)와 저장된 location_profiles가 모두 없습니다.",
+                )
+            raise
+
+        used_radius = requested_radius
+        if len(candidates) < 9:
+            collector_triggered = True
+            used_radius = 1000 if requested_radius < 1000 else requested_radius
+            
+            # 🚀 가장 의심되는 지점: 이 함수 호출 시 서버가 죽는지 로그로 확인 예정
+            _run_collector_pipeline(
+                db=db,
+                user=current_user,
+                payload=CollectorRunRequest(
+                    label=label,
+                    address_text=resolved_address_text,
+                    lat=resolved_lat,
+                    lng=resolved_lng,
+                    radius_m=used_radius,
+                    max_restaurants=100,
+                ),
+            )
+            candidates = _query_verified_menu_candidates(
+                db=db,
+                user_number=current_user.user_number,
+                label=label,
                 radius_m=used_radius,
-                max_restaurants=100,
-            ),
-        )
-        candidates = _query_verified_menu_candidates(
-            db=db,
-            user_number=current_user.user_number,
-            label=label,
-            radius_m=used_radius,
-        )
+            )
 
-    total_candidates = len(candidates)
-    ranked: dict[str, list[dict]] = {"breakfast": [], "lunch": [], "dinner": []}
-    used_menu_ids: set[int] = set()
-    for meal in ("breakfast", "lunch", "dinner"):
-        target = meal_targets[meal]
-        filtered = [
-            item
-            for item in candidates
-            if _is_likely_open_for_meal(item, meal)
-            and _is_goal_compatible(item, goal_type, target)
-        ]
-        scored = sorted(
-            filtered,
-            key=lambda item: _menu_score(item, target, goal_type),
-            reverse=True,
-        )
-        picked: list[dict] = []
-        for item in scored:
-            menu_id = int(item.get("menu_id"))
-            if menu_id in used_menu_ids:
-                continue
-            picked.append(item)
-            used_menu_ids.add(menu_id)
-            if len(picked) >= 3:
-                break
-        ranked[meal] = picked
+        total_candidates = len(candidates)
+        ranked: dict[str, list[dict]] = {"breakfast": [], "lunch": [], "dinner": []}
+        used_menu_ids: set[int] = set()
+        
+        for meal in ("breakfast", "lunch", "dinner"):
+            target = meal_targets[meal]
+            filtered = [
+                item for item in candidates
+                if _is_likely_open_for_meal(item, meal)
+                and _is_goal_compatible(item, goal_type, target)
+            ]
+            scored = sorted(
+                filtered,
+                key=lambda item: _menu_score(item, target, goal_type),
+                reverse=True,
+            )
+            picked: list[dict] = []
+            for item in scored:
+                menu_id = int(item.get("menu_id"))
+                if menu_id in used_menu_ids:
+                    continue
+                picked.append(item)
+                used_menu_ids.add(menu_id)
+                if len(picked) >= 3:
+                    break
+            ranked[meal] = picked
 
-    def _to_personalized_menu_item(row: dict) -> PersonalizedMenuItem:
-        return PersonalizedMenuItem(
-            restaurant_id=int(row["restaurant_id"]),
-            restaurant_name=str(row["restaurant_name"]),
-            place_url=str(row.get("place_url") or ""),
-            menu_id=int(row["menu_id"]),
-            menu_name=str(row["menu_name"]),
-            price=float(row["price"]),
-            distance_m=float(row["distance_m"]),
-            calories_kcal=float(row["calories_kcal"]),
-            carbs_g=float(row["carbs_g"]),
-            protein_g=float(row["protein_g"]),
-            fat_g=float(row["fat_g"]),
-            confidence=float(row["confidence"]),
-        )
+        def _to_personalized_menu_item(row: dict) -> PersonalizedMenuItem:
+            return PersonalizedMenuItem(
+                restaurant_id=int(row["restaurant_id"]),
+                restaurant_name=str(row["restaurant_name"]),
+                place_url=str(row.get("place_url") or ""),
+                menu_id=int(row["menu_id"]),
+                menu_name=str(row["menu_name"]),
+                price=float(row["price"]),
+                distance_m=float(row["distance_m"]),
+                calories_kcal=float(row["calories_kcal"]),
+                carbs_g=float(row["carbs_g"]),
+                protein_g=float(row["protein_g"]),
+                fat_g=float(row["fat_g"]),
+                confidence=float(row["confidence"]),
+            )
 
-    record_ids: Optional[List[int]] = None
-    record_results: Optional[List[RecommendRecordResultItem]] = None
-    if payload.meals:
-        record_ids, record_results = _save_recommend_meals_to_records(
-            db=db,
-            user=current_user,
-            meals=payload.meals,
-            record_date=payload.record_date,
-        )
-        db.commit()
+        record_ids: Optional[List[int]] = None
+        record_results: Optional[List[RecommendRecordResultItem]] = None
+        if payload.meals:
+            record_ids, record_results = _save_recommend_meals_to_records(
+                db=db,
+                user=current_user,
+                meals=payload.meals,
+                record_date=payload.record_date,
+            )
+            db.commit()
 
-    return PersonalizedMenuResponse(
-        goal_type=goal_type,
-        tdee_kcal=tdee_kcal,
-        daily_target_kcal=daily_target_kcal,
-        meal_target_kcal=meal_targets,
-        total_candidates=total_candidates,
-        used_radius_m=used_radius,
-        collector_triggered=collector_triggered,
-        breakfast=[_to_personalized_menu_item(row) for row in ranked["breakfast"]],
-        lunch=[_to_personalized_menu_item(row) for row in ranked["lunch"]],
-        dinner=[_to_personalized_menu_item(row) for row in ranked["dinner"]],
-        record_ids=record_ids,
-        record_results=record_results,
-    )
+        return PersonalizedMenuResponse(
+            goal_type=goal_type,
+            tdee_kcal=tdee_kcal,
+            daily_target_kcal=daily_target_kcal,
+            meal_target_kcal=meal_targets,
+            total_candidates=total_candidates,
+            used_radius_m=used_radius,
+            collector_triggered=collector_triggered,
+            breakfast=[_to_personalized_menu_item(row) for row in ranked["breakfast"]],
+            lunch=[_to_personalized_menu_item(row) for row in ranked["lunch"]],
+            dinner=[_to_personalized_menu_item(row) for row in ranked["dinner"]],
+            record_ids=record_ids,
+            record_results=record_results,
+        )
+        # --- 기존 로직 끝 ---
+
+    except Exception as e:
+        # 🚨 여기서 에러의 실체를 터미널(로그)에 출력합니다!
+        error_traceback = traceback.format_exc()
+        print("\n" + "="*60)
+        print("🔥 [CRITICAL ERROR] menu-save API에서 서버 크래시 발생!")
+        print(f"에러 메시지: {str(e)}")
+        print(f"상세 경로:\n{error_traceback}")
+        print("="*60 + "\n")
+        
+        # 서버가 죽지 않도록 500 에러를 던져주고 응답을 유지합니다.
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Internal Server Error: {str(e)}"
+        )
 
 
 @app.post("/api/collector/run", response_model=CollectorRunResponse)
