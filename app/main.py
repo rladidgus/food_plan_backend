@@ -3030,12 +3030,6 @@ def generate_menu_save(
         print(f"상세 경로:\n{error_traceback}")
         print("="*60 + "\n")
         
-        if response.status_code != 200:
-            print(f"❌ 카카오 응답 코드: {response.status_code}")
-            print(f"❌ 카카오 에러 메시지: {response.text}") # <--- 이게 핵심!
-            raise HTTPException(status_code=502, detail="Kakao Geocoding API 오류")
-
-        
         # 서버가 죽지 않도록 500 에러를 던져주고 응답을 유지합니다.
         raise HTTPException(
             status_code=500, 
