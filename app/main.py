@@ -1364,9 +1364,9 @@ def _is_valid_menu_name(name: str, restaurant_name: str = "") -> bool:
         return False
 
     bad_keywords = [
-        "강남역", "추천", "맛집", "혼밥", "후기", "리뷰", "방문", "다녀왔", "instagram",
+        "추천", "맛집", "혼밥", "후기", "리뷰", "방문", "다녀왔", "instagram",
         "인스타", "블로그", "주소", "전화", "영업시간", "예약", "주차", "원산지",
-        "메뉴판", "무한리필", "셀프바", "출구점", "점심", "저녁", "브레이크타임",
+        "무한리필", "셀프바", "출구점", "점심", "저녁", "브레이크타임",
         "이전 페이지", "완벽한 하루", "런치", "lunch", "dinner",
     ]
     lower = value.lower()
@@ -2985,11 +2985,17 @@ def generate_menu_save(
                 radius_m=used_radius,
                 max_restaurants=100,
             )
-            # 응답을 막지 않도록 수집은 백그라운드에서 별도 DB 세션으로 수행한다.
-            background_tasks.add_task(
-                _run_collector_pipeline_background,
-                int(current_user.user_number),
-                collector_payload.model_dump(),
+            # onboarding 흐름에서 로딩 완료 후 다음 단계로 이동하도록 동기 실행
+            _run_collector_pipeline(
+                db=db,
+                user=current_user,
+                payload=collector_payload,
+            )
+            candidates = _query_verified_menu_candidates(
+                db=db,
+                user_number=current_user.user_number,
+                label=label,
+                radius_m=used_radius,
             )
 
         total_candidates = len(candidates)
