@@ -363,8 +363,15 @@ def _resolve_tdee_kcal_for_user(db: Session, user: User) -> int:
         bmr = 24.0 * fallback_weight
 
     activity_level = normalize_activity_level(profile.activity_level) if profile else "moderate"
-    factor = ACTIVITY_FACTORS.get(activity_level or "moderate", ACTIVITY_FACTORS["moderate"])
-    return int(round(float(bmr) * float(factor)))
+    goal_type = _resolve_goal_type_for_user(db, user.user_number)
+    
+    target = estimate_target_calorie(
+        goal_type=goal_type,
+        bmr_kcal=bmr,
+        weight_kg=weight,
+        activity_level=activity_level
+    )
+    return int(round(target)) if target else 0
 
 
 def _goal_daily_target_kcal(tdee_kcal: int, goal_type: str) -> int:
@@ -746,12 +753,7 @@ def _kakao_geocode_address(address_text: str) -> tuple[float, float]:
             timeout=TIMEOUT,
         )
         if resp.status_code != 200:
-            print("\n" + "!" * 40)
-            print("❌ 카카오 API 호출 실패!")
-            print(f"❌ 요청 주소: {query}")
-            print(f"❌ 응답 상태 코드: {resp.status_code}")
-            print(f"❌ 카카오 서버의 답변: {resp.text}")
-            print("!" * 40 + "\n")
+            logger.error("Kakao Geocoding API failed: status=%s, body=%s", resp.status_code, resp.text)
             raise HTTPException(status_code=502, detail="Kakao Geocoding API 오류")
         data = resp.json()
         docs = data.get("documents") or []
@@ -3209,6 +3211,13 @@ def get_today_intake_from_plan(
         or "maintain"
     )
     target_calorie = latest_goal.target_calorie if latest_goal and latest_goal.target_calorie is not None else None
+    
+    # 목표 칼로리가 없을 경우(신규 가입 등) 실시간 계산 폴백
+    if target_calorie is None:
+        try:
+            target_calorie = _resolve_tdee_kcal_for_user(db, current_user)
+        except Exception:
+            target_calorie = 0
 
     return {
         "goal_type": goal_type,
@@ -3241,6 +3250,23 @@ def update_activity_level(
         db.add(profile)
 
     profile.activity_level = level
+    
+    # 활동 수준 변경에 따른 목표 칼로리(Target Calorie) 즉시 업데이트
+    if profile.bmr and profile.goal_type:
+        try:
+            target_calorie = estimate_target_calorie(
+                goal_type=profile.goal_type,
+                bmr_kcal=profile.bmr,
+                weight_kg=profile.weight,
+                activity_level=level
+            )
+            latest_goal = db.query(UserGoal).filter(UserGoal.user_number == current_user.user_number).order_by(UserGoal.created_at.desc()).first()
+            if latest_goal:
+                latest_goal.target_calorie = target_calorie
+                print(f"Goal updated for user {current_user.user_number}: {target_calorie} kcal")
+        except Exception as e:
+            logger.error("Failed to update goal calorie on activity update: %s", e)
+
     db.commit()
     return {"user_number": current_user.user_number, "activity_level": level, "factor": ACTIVITY_FACTORS[level]}
 
