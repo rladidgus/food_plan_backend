@@ -11,7 +11,7 @@ import math
 from datetime import date, datetime, timezone, time, timedelta
 from pathlib import Path
 from uuid import uuid4
-from sqlalchemy import and_, func
+from sqlalchemy import and_, func, or_
 from sqlalchemy.exc import IntegrityError
 from fastapi.responses import RedirectResponse
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, status, Query, BackgroundTasks, Request
@@ -2562,6 +2562,50 @@ def logout():
     return {"message": "로그아웃 성공"}
 
 
+@app.delete("/api/user/withdraw", response_model=LogoutResponse)
+def withdraw_user(
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    """회원 탈퇴: 사용자 소유 데이터 전체 삭제 후 계정 삭제"""
+    user_number = current_user.user_number
+
+    try:
+        location_ids = [
+            row[0]
+            for row in (
+                db.query(LocationProfile.location_id)
+                .filter(LocationProfile.user_number == user_number)
+                .all()
+            )
+        ]
+
+        if location_ids:
+            db.query(RestaurantSnapshot).filter(
+                RestaurantSnapshot.location_profile_id.in_(location_ids)
+            ).delete(synchronize_session=False)
+
+        db.query(Record).filter(Record.user_number == user_number).delete(synchronize_session=False)
+        db.query(Food).filter(Food.user_number == user_number).delete(synchronize_session=False)
+        db.query(FoodAnalysisResult).filter(
+            FoodAnalysisResult.user_number == user_number
+        ).delete(synchronize_session=False)
+        db.query(UserDietPlan).filter(UserDietPlan.user_number == user_number).delete(synchronize_session=False)
+        db.query(UserGoal).filter(UserGoal.user_number == user_number).delete(synchronize_session=False)
+        db.query(BMIHistory).filter(BMIHistory.user_number == user_number).delete(synchronize_session=False)
+        db.query(InBodyRecord).filter(InBodyRecord.user_number == user_number).delete(synchronize_session=False)
+        db.query(DailyActivity).filter(DailyActivity.user_number == user_number).delete(synchronize_session=False)
+        db.query(LocationProfile).filter(LocationProfile.user_number == user_number).delete(synchronize_session=False)
+        db.query(UserProfile).filter(UserProfile.user_number == user_number).delete(synchronize_session=False)
+
+        db.query(User).filter(User.user_number == user_number).delete(synchronize_session=False)
+        db.commit()
+        return {"message": "회원 탈퇴가 완료되었습니다."}
+    except Exception:
+        db.rollback()
+        raise
+
+
 @app.get("/api/user", response_model=UserResponse)
 def get_user(current_user: User = Depends(get_current_user_from_token)):
     """사용자 기본 정보 조회"""
@@ -2825,7 +2869,49 @@ def _save_recommend_meals_to_records(
                 detail=f"menu_id={meal.menu_id} 영양정보가 부족합니다. calories/carbs/protein/fat를 함께 보내주세요.",
             )
 
-        food_name = (meal.name or "").strip() or f"{menu.restaurant_name} {menu.menu_name}".strip()
+        canonical_food_name = f"{menu.restaurant_name} {menu.menu_name}".strip()
+        food_name = (meal.name or "").strip() or canonical_food_name
+        calories_value = float(menu.calories_kcal if menu.calories_kcal is not None else meal.calories_kcal)
+        protein_value = float(menu.protein_g if menu.protein_g is not None else meal.protein_g)
+        carb_value = float(menu.carbs_g if menu.carbs_g is not None else meal.carbs_g)
+        fat_value = float(menu.fat_g if menu.fat_g is not None else meal.fat_g)
+        record_dt = datetime.combine(record_day, meal_time_map.get(meal_type, time(12, 0, 0)))
+
+        candidate_names = {food_name.strip(), canonical_food_name.strip(), str(menu.menu_name or "").strip()}
+        candidate_names = {name for name in candidate_names if name}
+
+        def _find_existing_recommend_record() -> Optional[Record]:
+            base_q = (
+                db.query(Record)
+                .filter(
+                    Record.user_number == user.user_number,
+                    Record.meal_type == meal_type,
+                    Record.record_created_at >= day_start,
+                    Record.record_created_at < day_end,
+                )
+            )
+
+            name_match = None
+            if candidate_names:
+                name_match = Record.food_name.in_(sorted(candidate_names))
+
+            nutrition_match = and_(
+                Record.food_calories == calories_value,
+                Record.food_protein == protein_value,
+                Record.food_carb == carb_value,
+                Record.food_fat == fat_value,
+            )
+
+            if name_match is not None:
+                base_q = base_q.filter(or_(name_match, nutrition_match))
+            else:
+                base_q = base_q.filter(nutrition_match)
+
+            return (
+                base_q
+                .order_by(Record.record_created_at.desc(), Record.record_id.desc())
+                .first()
+            )
 
         if not bool(meal.checked):
             row = None
@@ -2839,19 +2925,8 @@ def _save_recommend_meals_to_records(
                     .first()
                 )
             else:
-                # 프론트가 record_id를 아직 보내지 않는 경우를 위한 임시 fallback
-                row = (
-                    db.query(Record)
-                    .filter(
-                        Record.user_number == user.user_number,
-                        Record.meal_type == meal_type,
-                        Record.food_name == food_name,
-                        Record.record_created_at >= day_start,
-                        Record.record_created_at < day_end,
-                    )
-                    .order_by(Record.record_created_at.desc(), Record.record_id.desc())
-                    .first()
-                )
+                # 프론트가 record_id를 아직 보내지 않는 경우 fallback (이름/영양값 기반)
+                row = _find_existing_recommend_record()
             deleted_record_id: Optional[int] = None
             if row:
                 deleted_record_id = int(row.record_id)
@@ -2876,24 +2951,7 @@ def _save_recommend_meals_to_records(
                 .first()
             )
         if existing_row is None:
-            existing_row = (
-                db.query(Record)
-                .filter(
-                    Record.user_number == user.user_number,
-                    Record.meal_type == meal_type,
-                    Record.food_name == food_name,
-                    Record.record_created_at >= day_start,
-                    Record.record_created_at < day_end,
-                )
-                .order_by(Record.record_created_at.desc(), Record.record_id.desc())
-                .first()
-            )
-
-        calories_value = float(menu.calories_kcal if menu.calories_kcal is not None else meal.calories_kcal)
-        protein_value = float(menu.protein_g if menu.protein_g is not None else meal.protein_g)
-        carb_value = float(menu.carbs_g if menu.carbs_g is not None else meal.carbs_g)
-        fat_value = float(menu.fat_g if menu.fat_g is not None else meal.fat_g)
-        record_dt = datetime.combine(record_day, meal_time_map.get(meal_type, time(12, 0, 0)))
+            existing_row = _find_existing_recommend_record()
 
         if existing_row:
             existing_row.food_name = food_name
