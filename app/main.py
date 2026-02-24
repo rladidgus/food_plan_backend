@@ -27,6 +27,7 @@ from typing import List, Optional
 from app import models
 from app.inbody_ocr import extract_key_values, format_key_values, upstage_ocr_from_bytes, update_user_inbody
 from app.models import (
+    Food,
     BMIHistory,
     Record,
     InBodyRecord,
@@ -2562,6 +2563,64 @@ def read_users_me(
 def logout():
     """로그아웃 (JWT 환경에서는 클라이언트에서 토큰 폐기)"""
     return {"message": "로그아웃 성공"}
+
+@app.delete("/api/user/withdraw", response_model=LogoutResponse)
+def withdraw_user(
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    """회원 탈퇴: 사용자 소유 데이터 전체 삭제 후 계정 삭제"""
+    user_number = current_user.user_number
+
+    try:
+        user_row = (
+            db.query(User)
+            .filter(User.user_number == user_number)
+            .one_or_none()
+        )
+        if not user_row:
+            raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
+
+        location_ids = [
+            row[0]
+            for row in (
+                db.query(LocationProfile.location_id)
+                .filter(LocationProfile.user_number == user_number)
+                .all()
+            )
+        ]
+
+        if location_ids:
+            db.query(RestaurantSnapshot).filter(
+                RestaurantSnapshot.location_profile_id.in_(location_ids)
+            ).delete(synchronize_session=False)
+
+        db.query(Record).filter(Record.user_number == user_number).delete(synchronize_session=False)
+        db.query(Food).filter(Food.user_number == user_number).delete(synchronize_session=False)
+        db.query(FoodAnalysisResult).filter(
+            FoodAnalysisResult.user_number == user_number
+        ).delete(synchronize_session=False)
+        db.query(UserDietPlan).filter(UserDietPlan.user_number == user_number).delete(synchronize_session=False)
+        db.query(UserGoal).filter(UserGoal.user_number == user_number).delete(synchronize_session=False)
+        db.query(BMIHistory).filter(BMIHistory.user_number == user_number).delete(synchronize_session=False)
+        db.query(InBodyRecord).filter(InBodyRecord.user_number == user_number).delete(synchronize_session=False)
+        db.query(DailyActivity).filter(DailyActivity.user_number == user_number).delete(synchronize_session=False)
+        db.query(LocationProfile).filter(LocationProfile.user_number == user_number).delete(synchronize_session=False)
+        db.query(UserProfile).filter(UserProfile.user_number == user_number).delete(synchronize_session=False)
+        db.flush()
+
+        # 부모(users)는 마지막에 ORM delete로 처리하여 FK 제약 오류 가능성을 줄인다.
+        db.delete(user_row)
+        db.commit()
+        return {"message": "회원 탈퇴가 완료되었습니다."}
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as exc:
+        db.rollback()
+        logger.exception("withdraw_user failed user_number=%s error=%s", user_number, exc)
+        raise HTTPException(status_code=500, detail="회원 탈퇴 처리 중 오류가 발생했습니다.")
+
 
 
 @app.get("/api/user", response_model=UserResponse)
