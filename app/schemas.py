@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any, List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class DietRecordRequest(BaseModel):
@@ -195,6 +195,9 @@ class TodayIntakeResponse(BaseModel):
     total_carbs_g: float
     total_protein_g: float
     total_fat_g: float
+    checked_meal_count: int = 0
+    checked_meal_types: List[str] = Field(default_factory=list)
+    meal_check_status: dict[str, bool] = Field(default_factory=dict)
     plan_date: Optional[str] = None
 
 

@@ -2738,16 +2738,7 @@ def upsert_user_goal(
     )
     db.commit()
 
-    day0 = plan.days[0]
-    today_intake = TodayIntakeResponse(
-        goal_type=plan.goal_type,
-        target_calorie=plan.target_calorie,
-        total_calories_kcal=int(day0.total_calories_kcal),
-        total_carbs_g=float(day0.total_carbs_g),
-        total_protein_g=float(day0.total_protein_g),
-        total_fat_g=float(day0.total_fat_g),
-        plan_date=day0.date,
-    )
+    today_intake = _build_today_intake_response(db=db, user=user)
 
     return {
         "goal_id": goal.goal_id,
@@ -2782,18 +2773,16 @@ def _save_recommend_meals_to_records(
         except ValueError:
             raise HTTPException(status_code=400, detail="record_date는 YYYY-MM-DD 형식이어야 합니다.")
 
-    allowed_meal_types = {"breakfast", "lunch", "dinner", "snack", "아침", "점심", "저녁", "간식"}
+    allowed_meal_types = {"breakfast", "lunch", "dinner", "아침", "점심", "저녁"}
     meal_type_alias = {
         "아침": "breakfast",
         "점심": "lunch",
         "저녁": "dinner",
-        "간식": "snack",
     }
     meal_time_map = {
         "breakfast": time(8, 0, 0),
         "lunch": time(13, 0, 0),
         "dinner": time(19, 0, 0),
-        "snack": time(16, 0, 0),
     }
     day_start = datetime.combine(record_day, time.min)
     day_end = day_start + timedelta(days=1)
@@ -2802,7 +2791,7 @@ def _save_recommend_meals_to_records(
     for meal in meals:
         raw_type = (meal.meal_type or "").strip().lower()
         if raw_type not in allowed_meal_types:
-            raise HTTPException(status_code=400, detail="meal_type은 아침/점심/저녁/간식 중 하나여야 합니다.")
+            raise HTTPException(status_code=400, detail="meal_type은 아침/점심/저녁 중 하나여야 합니다.")
         meal_type = meal_type_alias.get(raw_type, raw_type)
 
         menu = (
@@ -2876,19 +2865,60 @@ def _save_recommend_meals_to_records(
             )
             continue
 
-        rec = Record(
-            user_number=user.user_number,
-            food_name=food_name,
-            food_calories=float(menu.calories_kcal if menu.calories_kcal is not None else meal.calories_kcal),
-            food_protein=float(menu.protein_g if menu.protein_g is not None else meal.protein_g),
-            food_carb=float(menu.carbs_g if menu.carbs_g is not None else meal.carbs_g),
-            food_fat=float(menu.fat_g if menu.fat_g is not None else meal.fat_g),
-            meal_type=meal_type,
-            # record 테이블의 기록일시 컬럼(record_created_at)을 명시적으로 사용
-            record_created_at=datetime.combine(record_day, meal_time_map.get(meal_type, time(12, 0, 0))),
-        )
-        db.add(rec)
-        db.flush()
+        existing_row = None
+        if meal.record_id is not None:
+            existing_row = (
+                db.query(Record)
+                .filter(
+                    Record.record_id == int(meal.record_id),
+                    Record.user_number == user.user_number,
+                )
+                .first()
+            )
+        if existing_row is None:
+            existing_row = (
+                db.query(Record)
+                .filter(
+                    Record.user_number == user.user_number,
+                    Record.meal_type == meal_type,
+                    Record.food_name == food_name,
+                    Record.record_created_at >= day_start,
+                    Record.record_created_at < day_end,
+                )
+                .order_by(Record.record_created_at.desc(), Record.record_id.desc())
+                .first()
+            )
+
+        calories_value = float(menu.calories_kcal if menu.calories_kcal is not None else meal.calories_kcal)
+        protein_value = float(menu.protein_g if menu.protein_g is not None else meal.protein_g)
+        carb_value = float(menu.carbs_g if menu.carbs_g is not None else meal.carbs_g)
+        fat_value = float(menu.fat_g if menu.fat_g is not None else meal.fat_g)
+        record_dt = datetime.combine(record_day, meal_time_map.get(meal_type, time(12, 0, 0)))
+
+        if existing_row:
+            existing_row.food_name = food_name
+            existing_row.food_calories = calories_value
+            existing_row.food_protein = protein_value
+            existing_row.food_carb = carb_value
+            existing_row.food_fat = fat_value
+            existing_row.meal_type = meal_type
+            existing_row.record_created_at = record_dt
+            rec = existing_row
+        else:
+            rec = Record(
+                user_number=user.user_number,
+                food_name=food_name,
+                food_calories=calories_value,
+                food_protein=protein_value,
+                food_carb=carb_value,
+                food_fat=fat_value,
+                meal_type=meal_type,
+                # record 테이블의 기록일시 컬럼(record_created_at)을 명시적으로 사용
+                record_created_at=record_dt,
+            )
+            db.add(rec)
+            db.flush()
+
         record_ids.append(rec.record_id)
         record_results.append(
             RecommendRecordResultItem(
@@ -3111,12 +3141,11 @@ def create_records_from_plan(
         except ValueError:
             raise HTTPException(status_code=400, detail="record_date는 YYYY-MM-DD 형식이어야 합니다.")
 
-    allowed_meal_types = {"breakfast", "lunch", "dinner", "snack", "아침", "점심", "저녁", "간식"}
+    allowed_meal_types = {"breakfast", "lunch", "dinner", "아침", "점심", "저녁"}
     meal_type_alias = {
         "아침": "breakfast",
         "점심": "lunch",
         "저녁": "dinner",
-        "간식": "snack",
     }
 
     record_ids: List[int] = []
@@ -3125,7 +3154,7 @@ def create_records_from_plan(
             raise HTTPException(status_code=400, detail="meal_type은 비어 있을 수 없습니다.")
         raw_type = meal.meal_type.strip().lower()
         if raw_type not in allowed_meal_types:
-            raise HTTPException(status_code=400, detail="meal_type은 아침/점심/저녁/간식 중 하나여야 합니다.")
+            raise HTTPException(status_code=400, detail="meal_type은 아침/점심/저녁 중 하나여야 합니다.")
         meal_type = meal_type_alias.get(raw_type, raw_type)
 
         if not meal.name or not meal.name.strip():
@@ -3172,57 +3201,90 @@ def create_records_from_recommendation(
     return {"record_ids": record_ids}
 
 
-@app.get("/api/intake/today", response_model=TodayIntakeResponse)
-def get_today_intake_from_plan(
-    current_user: User = Depends(get_current_user_from_token),
-    db: Session = Depends(get_db),
-):
-    """최신 1일 식단 계획에서 총 영양정보 반환"""
-    user = current_user
+def _build_today_intake_response(db: Session, user: User) -> dict:
+    today_start = datetime.combine(datetime.now().date(), time.min)
+    today_end = today_start + timedelta(days=1)
 
-    plan_record = (
-        db.query(UserDietPlan)
-        .filter(UserDietPlan.user_number == user.user_number)
-        .order_by(UserDietPlan.created_at.desc())
-        .first()
+    rows = (
+        db.query(Record)
+        .filter(
+            Record.user_number == user.user_number,
+            Record.record_created_at >= today_start,
+            Record.record_created_at < today_end,
+        )
+        .all()
     )
-    if not plan_record:
-        raise HTTPException(status_code=404, detail="식단 계획이 없습니다.")
 
-    try:
-        plan = json.loads(plan_record.plan_json)
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="식단 계획 데이터가 손상되었습니다.")
-
-    days = plan.get("days") or []
-    if not days:
-        raise HTTPException(status_code=500, detail="식단 계획에 day 데이터가 없습니다.")
-
-    day0 = days[0]
-    goal_type = plan.get("goal_type") or plan_record.goal_type or "maintain"
-    
-    # target_calorie: UserGoal DB가 가장 정확한 출처 (AI 응답값은 신뢰하지 않음)
     latest_goal = (
         db.query(UserGoal)
         .filter(UserGoal.user_number == user.user_number)
         .order_by(UserGoal.created_at.desc())
         .first()
     )
-    target_calorie = (
-        (latest_goal.target_calorie if latest_goal and latest_goal.target_calorie else None)
-        or plan_record.target_calorie
-        or None
+    profile = (
+        db.query(UserProfile)
+        .filter(UserProfile.user_number == user.user_number)
+        .one_or_none()
     )
-    
+    goal_type = _normalize_goal_type(
+        (latest_goal.goal_type if latest_goal and latest_goal.goal_type else None)
+        or (profile.goal_type if profile and profile.goal_type else None)
+        or "maintain"
+    ) or "maintain"
+
+    target_calorie: Optional[float] = None
+    if latest_goal and latest_goal.target_calorie is not None:
+        target_calorie = float(latest_goal.target_calorie)
+    else:
+        latest_plan = (
+            db.query(UserDietPlan)
+            .filter(UserDietPlan.user_number == user.user_number)
+            .order_by(UserDietPlan.created_at.desc())
+            .first()
+        )
+        if latest_plan and latest_plan.target_calorie is not None:
+            target_calorie = float(latest_plan.target_calorie)
+        else:
+            try:
+                tdee_kcal = _resolve_tdee_kcal_for_user(db, user)
+                target_calorie = float(_goal_daily_target_kcal(tdee_kcal, goal_type))
+            except Exception:
+                target_calorie = None
+
+    checked_meal_types = sorted(
+        {
+            str(r.meal_type).lower()
+            for r in rows
+            if r.meal_type and str(r.meal_type).lower() in {"breakfast", "lunch", "dinner"}
+        }
+    )
+    meal_check_status = {
+        "breakfast": "breakfast" in checked_meal_types,
+        "lunch": "lunch" in checked_meal_types,
+        "dinner": "dinner" in checked_meal_types,
+    }
 
     return {
         "goal_type": goal_type,
-        "target_calorie": float(target_calorie) if target_calorie else None,
-        "total_calories_kcal": int(day0.get("total_calories_kcal") or 0),
-        "total_carbs_g": float(day0.get("total_carbs_g") or 0),
-        "total_protein_g": float(day0.get("total_protein_g") or 0),
-        "total_fat_g": float(day0.get("total_fat_g") or 0),
+        "target_calorie": target_calorie,
+        "total_calories_kcal": int(round(sum(float(r.food_calories or 0) for r in rows))),
+        "total_carbs_g": float(sum(float(r.food_carb or 0) for r in rows)),
+        "total_protein_g": float(sum(float(r.food_protein or 0) for r in rows)),
+        "total_fat_g": float(sum(float(r.food_fat or 0) for r in rows)),
+        "checked_meal_count": len(checked_meal_types),
+        "checked_meal_types": checked_meal_types,
+        "meal_check_status": meal_check_status,
+        "plan_date": today_start.date().isoformat(),
     }
+
+
+@app.get("/api/intake/today", response_model=TodayIntakeResponse)
+def get_today_intake_from_plan(
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_db),
+):
+    """오늘 섭취 요약 반환 (마이페이지 표시용)"""
+    return _build_today_intake_response(db=db, user=current_user)
 
 
 @app.post("/api/user/activity-level")
@@ -4093,7 +4155,8 @@ async def vision_food(
         db.refresh(far)
 
         # 2) ✅ 화면 조회용 Record 저장 (GET /api/record가 이걸 가져감)
-        record_created_at = datetime.utcnow()
+        # /api/intake/today 는 로컬 날짜 기준으로 집계하므로 기본 기록 시각도 로컬 now로 맞춘다.
+        record_created_at = datetime.now()
         if record_date:
             try:
                 day = datetime.strptime(record_date, "%Y-%m-%d").date()
