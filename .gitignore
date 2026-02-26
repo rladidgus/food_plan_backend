@@ -9,12 +9,17 @@ env/
 # --- 도커 및 데이터베이스 (가장 중요) ---
 # 권한 에러 방지 및 로컬 데이터 분리
 postgres_data/
+chroma_data/
 
 # --- 보안 및 설정 (필수) ---
 # 비밀번호나 API 키가 담길 파일
 .env
+.env.prod
 
 # --- 에디터 및 OS (선택) ---
 .vscode/
 .idea/
 .DS_Store
+# uploads (runtime-generated)
+uploads/
+
